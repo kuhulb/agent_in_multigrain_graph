@@ -12,3 +12,4 @@
 - Keep tests and fixture products under tests/ or reports/. Do not modify other users' jobs or services.
 - After a completed code change and appropriate verification, inspect the diff, commit only source changes with a clear message, and push to the configured GitHub remote. Respect user instructions to defer a push. Avoid empty commits.
 - Before staging, check that private settings, datasets, models, experiment outputs, unpublished source materials and original coarsening bytecode are excluded. Stage explicit paths and review the staged file list.
+- Never open, copy or print Git credential stores, including .git/github-credentials. Use Git's configured credential helper for authenticated operations.
