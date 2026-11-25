@@ -1,4 +1,4 @@
-"""Freeze a proportional sample of the existing validation or test IDs."""
+"""Freeze a proportional sample of IDs from an existing dataset split."""
 
 import argparse
 from collections import defaultdict
@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from experiment_io import config_path, file_hash, load_env, read_json, write_json
-from main import load_evaluation_labels
+from main import TARGET_SPLITS, load_evaluation_labels
 
 
 def sample_targets(rows, split, size, seed):
@@ -48,7 +48,7 @@ def sample_targets(rows, split, size, seed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", default="experiment.env")
-    parser.add_argument("--split", choices=("val", "test"), required=True)
+    parser.add_argument("--split", choices=TARGET_SPLITS, required=True)
     parser.add_argument("--size", type=int, required=True)
     parser.add_argument("--seed", type=int, default=234)
     parser.add_argument("--output", required=True)

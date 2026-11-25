@@ -135,6 +135,10 @@ def test_fixed_plan_validation_and_resume(tmp_path):
         )
     with pytest.raises(ValueError, match="label/split version"):
         main.select_plan_targets(plan, rows, "toy", "graph-v1", {})
+    train_plan = dict(plan, split="train", size=1, paper_ids=["p0"])
+    assert main.select_plan_targets(train_plan, rows, "toy", "graph-v1", sources) == [rows[0]]
+    with pytest.raises(ValueError, match="outside"):
+        main.select_plan_targets(dict(train_plan, paper_ids=["p1"]), rows, "toy", "graph-v1", sources)
     write_json(tmp_path / "plan.json", plan)
     fixed = main.freeze_inputs(c, data, cache, store)
     assert [row["fine_id"] for row in fixed["targets"]] == [2, 1]

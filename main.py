@@ -45,6 +45,7 @@ from experiment_io import (
 )
 
 MODES = {"target_only", "fine_only", "coarse_only", "multi"}
+TARGET_SPLITS = ("train", "val", "test")
 SYSTEM = """你根据论文文本和允许读取的图证据分类，通过 submit 提交候选类别。
 F: 为原始论文，C: 为社区。目标论文从开始可见。社区摘要可能包含目标本身，也可能丢失细节。结构凝聚度与相似度都不能单独判定类别。
 multi 优先考虑目标节点及所属超节点。证据足够就提交。需要更多证据时通常先查询粗图邻域，以减少细粒度访问开销。当细粒度证据更有价值时，可以直接查询原始节点或展开已见超节点。根据当前证据自由选择后续查询。
@@ -217,7 +218,7 @@ def load_evaluation_labels(c, raw):
                 r["paper_id"] in seen
                 or r["paper_id"] not in lookup
                 or r["class_id"] not in ids
-                or r["split"] not in ("train", "val", "test")
+                or r["split"] not in TARGET_SPLITS
             ):
                 raise ValueError("Invalid/duplicate label row")
             seen.add(r["paper_id"])
@@ -248,7 +249,7 @@ def select_plan_targets(plan, rows, dataset, graph_hash, sources):
     paper_ids = plan.get("paper_ids")
     split = plan.get("split")
     if (
-        split not in ("val", "test")
+        split not in TARGET_SPLITS
         or not isinstance(paper_ids, list)
         or not paper_ids
         or any(not isinstance(paper_id, str) for paper_id in paper_ids)
@@ -287,8 +288,8 @@ def freeze_inputs(c, data, folder, store):
             "sampling": plan.get("sampling"),
         }
     else:
-        if split not in ("val", "test"):
-            raise ValueError("Target split must be val/test")
+        if split not in TARGET_SPLITS:
+            raise ValueError("Target split must be train, val or test")
         targets = sorted([r for r in rows if r["split"] == split], key=lambda x: x["fine_id"])
         seed = integer(c, "AGENT_TARGET_SEED", 234)
         random.Random(seed).shuffle(targets)
@@ -1484,7 +1485,7 @@ def run(c):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="experiment.env")
-    parser.add_argument("--target-split")
+    parser.add_argument("--target-split", choices=TARGET_SPLITS)
     parser.add_argument("--target-limit", type=int)
     parser.add_argument("--target-seed", type=int)
     parser.add_argument("--target-plan", help="Use an existing evaluation node plan")
