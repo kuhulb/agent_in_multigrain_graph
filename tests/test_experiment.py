@@ -255,6 +255,71 @@ def test_mixed_native_calls_keep_membership_and_duplicate_relation(data, config)
     ]
     assert results[1]["already_read"][0]["ref"] == "F:1"
     assert not results[1]["new_evidence"] and final["counts"]["graph_tool_calls"] == 3
+    first, second = [json.loads(m["content"]) for m in final["messages"][-2:]]
+    assert first["members"]["C:0"]["nodes"] == ["F:1"]
+    assert second["neighbors"]["F:0"]["nodes"] == ["F:1"]
+    assert "F:1" in first["evidence"] and second["evidence"] == {}
+
+
+def test_compact_neighbors_keep_shared_edges_and_duplicate_feedback(data, config):
+    state = main.make_sample_state(data, 0, "multi", CLASSES, config)
+    state["counts"]["model_rounds"] = 1
+    state["seen_fine"].append(2)
+    state["first_seen_step"]["F:2"] = 0
+    calls = [call("search_1hop", {"queries": [
+        {"center": "F:0", "k": 1}, {"center": "F:2", "k": 2},
+        {"center": "F:0", "k": 1}, {"k": 1},
+    ]})]
+    final, results = pack(data, config, calls, state)
+    wire = json.loads(final["messages"][-1]["content"])
+    assert wire["neighbors"] == {
+        "F:0": {"remaining": 0, "nodes": ["F:1"]},
+        "F:2": {"remaining": 0, "nodes": ["F:3", "F:1"]},
+    }
+    assert [(e["index"], e["status"]) for e in wire["errors"]] == [
+        (2, "duplicate"), (3, "invalid_args"),
+    ]
+    assert set(wire["evidence"]) == {"F:1", "F:3"} and wire["budget"] == 4
+    assert wire["evidence"]["F:1"]["text"] == data["fine_texts"][1]
+    assert wire["evidence"]["F:1"]["same_community"] is True
+    assert results[0]["by_source"][1]["items"][1]["weight"] == 1
+    assert results[0]["state_delta"]["new_refs"] == ["F:1", "F:3"]
+
+
+def test_compact_members_preserve_ranking_and_count_after_mixed_calls(data, config):
+    data["members"][0] = [0, 1, 2, 3, 4]
+    data["fine_adj"][0] = [1, 2, 3]
+    data["vectors"]["fine"][1, 0] = 0.81239
+    data["vectors"]["fine"][2, 0] = 0.81248
+    calls = [
+        call("expand_community", {"queries": [{"community": "C:0", "k": 2}]}),
+        call("search_1hop", search("F:0"), id="next", index=1),
+    ]
+    final, results = pack(data, config, calls)
+    wire = json.loads(final["messages"][-2]["content"])
+    assert wire["members"]["C:0"] == {"remaining": 1, "nodes": ["F:2", "F:1"]}
+    assert wire["evidence"]["F:2"]["sim"] == wire["evidence"]["F:1"]["sim"] == 0.812
+    assert results[0]["by_source"][0]["items"][0]["similarity_to_target"] == 0.81248
+    assert results[0]["by_source"][0]["total_count"] == 5
+
+
+def test_compact_wire_preserves_coarse_structure_edge_and_terminal_hint(data, config):
+    config["AGENT_MAX_GRAPH_TOOL_CALLS"] = "1"
+    row = data["coarse"]["communities"][1]
+    row.update(summary_source="paper_fallback", summary_incomplete=True)
+    data["coarse_adj"][0][1] = 6
+    final, results = pack(data, config, [call("search_1hop", search("C:0"))])
+    wire = json.loads(final["messages"][-1]["content"])
+    assert wire["neighbors"] == {"C:0": {"remaining": 1, "nodes": ["C:1"], "weights": {"C:1": 6}}}
+    assert wire["budget"] == 0 and wire["submit_only"] is True
+    entry = wire["evidence"]["C:1"]
+    assert entry["text"] == data["coarse_texts"][1]
+    assert entry["size"] == row["size"] and entry["degree"] == len(data["coarse_adj"][1])
+    assert entry["density"] == row["stats"]["density"]
+    assert entry["ext_deg_frac"] == row["stats"]["ext_deg_frac"]
+    assert entry["summary_incomplete"] is True and entry["summary_source"] == "paper_fallback"
+    assert set(wire).isdisjoint({"by_source", "state_delta", "spent", "already_read", "ok"})
+    assert results[0]["state_delta"]["allowed_tools"] == ["submit"]
 
 
 def test_empty_uses_budget_exhausted_and_skipped_do_not(data, config):
@@ -285,6 +350,7 @@ def test_capacity_rollback_does_not_pollute_seen(data, config):
 def test_capacity_keeps_delivered_prefix_and_releases_deferred_budget(data, config):
     def counter(history):
         text = "".join(m["content"] for m in history if m["role"] == "tool")
+        assert '"state_delta"' not in text and '"by_source"' not in text
         return 100000 if "complete fine text 1" in text else 1
 
     tools = [call("search_1hop", {"queries": [
@@ -295,6 +361,26 @@ def test_capacity_keeps_delivered_prefix_and_releases_deferred_budget(data, conf
     assert state["seen_coarse"] == [0, 1] and state["seen_fine"] == [0]
     assert not state["neighbor_sent"].get("fine:0")
     assert state["counts"]["graph_tool_calls"] == 1
+    wire = json.loads(state["messages"][-1]["content"])
+    assert wire["neighbors"]["F:0"] == {"remaining": 1, "nodes": [], "status": "context_limited"}
+
+
+def test_compact_partial_response_preserves_undelivered_candidates(data, config):
+    data["fine_adj"][0] = [1, 2]
+    state = main.make_sample_state(data, 0, "fine_only", CLASSES, config)
+    state["counts"]["model_rounds"] = 1
+
+    def counter(history):
+        return 100000 if any(
+            m["role"] == "tool" and data["fine_texts"][2] in m["content"] for m in history
+        ) else 1
+
+    final, results = pack(data, config, [call("search_1hop", search("F:0", 2))], state, counter)
+    wire = json.loads(final["messages"][-1]["content"])
+    assert wire["neighbors"]["F:0"] == {"remaining": 1, "nodes": ["F:1"], "status": "partial"}
+    assert set(wire["evidence"]["F:1"]) == {"degree", "sim", "text"}
+    assert final["neighbor_sent"]["fine:0"] == [1] and final["seen_fine"] == [0, 1]
+    assert results[0]["by_source"][0]["remaining"] == 1
 
 
 def test_mixed_valid_submit_precedes_bad_query_id(data, config, tmp_path, monkeypatch):
@@ -546,6 +632,11 @@ def test_invalid_batch_item_returns_normal_feedback_without_repair(data, config,
     history = received[1]["messages"]
     assert history[:2] == received[0]["messages"] and received[0]["tools"] == received[1]["tools"]
     assert [x["id"] for x in history[-3]["tool_calls"]] == [x["tool_call_id"] for x in history[-2:]]
+    assert json.loads(history[-2]["content"])["neighbors"]["F:5"] == {
+        "nodes": [], "status": "invalid_center", "message": "Center must be visible at round start",
+    }
+    assert "spent" in first["results"][0] and "spent" not in json.loads(history[-2]["content"])
+    assert store.task("0:multi:0")["state"]["messages"][:len(history)] == history
 
 
 @pytest.mark.parametrize("first", [

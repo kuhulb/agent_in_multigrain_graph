@@ -18,7 +18,7 @@ import uuid
 
 VERSION = 3
 ALGORITHM = "multigrain-v3.1"
-AGENT_ALGORITHM = "multigrain-agent-v3.5"
+AGENT_ALGORITHM = "multigrain-agent-v3.6"
 TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
