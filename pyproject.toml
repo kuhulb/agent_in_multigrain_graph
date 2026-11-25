@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+cache-dir = ".cache/ruff"
+extend-exclude = [".cache", ".venv", ".venv-louvain", "private", "assets", "vendor", "data", "graph_builds", "experiments", "incoming", "logs", "reports"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
