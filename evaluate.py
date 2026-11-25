@@ -35,7 +35,7 @@ STATUSES = {
     "submitted",
 }
 METHOD_TERMINAL = {"submitted", "protocol_failure"}
-EVAL_VERSION = 4
+EVAL_VERSION = 5
 
 
 def token_summary(usages):
@@ -181,6 +181,7 @@ def evaluate_rows(results, label_data, options):
         for mode in modes:
             rows = [lookup[repeat, mode, t] for t in targets]
             scored = metrics([lookup[repeat, mode, t] for t in common], truth, classes)
+            planned_scores = metrics(rows, truth, classes)
             summary.append(
                 {
                     "repeat_id": repeat,
@@ -193,6 +194,11 @@ def evaluate_rows(results, label_data, options):
                         for r in rows
                     )
                     / len(targets),
+                    "end_to_end_macro_f1": planned_scores["macro_f1"],
+                    "failure_rate": sum(
+                        r["status"] in {"protocol_failure", "context_failure", "config_failure", "data_failure"}
+                        for r in rows
+                    ) / len(targets),
                     "common_n": len(common),
                     "common_accuracy": scored["accuracy"],
                     "common_macro_f1": scored["macro_f1"],
@@ -210,6 +216,9 @@ def evaluate_rows(results, label_data, options):
                 "new_fine_nodes",
                 "community_calls",
                 "retrieved_chars",
+                "initial_evidence_chars",
+                "distinct_accessed_coarse_nodes",
+                "distinct_accessed_fine_nodes",
                 "request_attempts",
             ):
                 values = [
@@ -219,10 +228,15 @@ def evaluate_rows(results, label_data, options):
                 ]
                 summary[-1][field + "_mean"] = sum(values) / len(values) if values else None
             for field in (
-                "tool_ok_rounds", "tool_partial_rounds", "tool_failed_rounds", "rounds_with_new_evidence"
+                "tool_ok_rounds", "tool_partial_rounds", "tool_failed_rounds", "rounds_with_new_evidence",
+                "model_rounds", "api_attempts", "api_retries", "repair_attempts", "logical_queries",
+                "tool_calls", "invalid_queries", "empty_queries", "skipped_queries", "sample_recoveries",
             ):
                 values = [r["counts"][field] for r in rows if field in r.get("counts", {})]
                 summary[-1][field] = sum(values) if values else None
+            elapsed = [r["elapsed_seconds"] for r in rows if "elapsed_seconds" in r]
+            summary[-1]["sample_elapsed_seconds_sum"] = sum(elapsed) if elapsed else None
+            summary[-1]["sample_elapsed_measured_n"] = len(elapsed)
             submitted = [r for r in rows if r["status"] == "submitted"]
             citations = [r["citations"] for r in submitted if "citations" in r]
             summary[-1]["citation_measured_n"] = len(citations)

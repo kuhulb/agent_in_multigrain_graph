@@ -18,8 +18,6 @@ from experiment_io import Store, request_model, usage_for, write_jsonl
 def config():
     return {
         "AGENT_MAX_GRAPH_TOOL_CALLS": "6",
-        "AGENT_MAX_CENTER_QUERIES": "6",
-        "AGENT_MAX_DISTINCT_COMMUNITIES": "2",
         "AGENT_MAX_MODEL_ROUNDS": "14",
         "AGENT_MAX_SEARCH_CALLS_PER_ROUND": "4",
         "AGENT_MIN_K": "1",
@@ -151,7 +149,7 @@ def call(name, args, id="call_1", index=0):
 
 
 def search(center, k=1):
-    return {"center": center, "k": k}
+    return {"queries": [{"center": center, "k": k}]}
 
 
 def test_graph_ids_edges_and_labels_are_separate(tmp_path):
@@ -186,120 +184,117 @@ def test_embedding_windows_cover_tail(length):
     assert all(b - a + 2 <= 8192 for a, b, _ in blocks)
 
 
+def pack(data, config, calls, state=None, counter=lambda _: 1):
+    if state is None:
+        state = main.make_sample_state(data, 0, "multi", CLASSES, config)
+        state["counts"]["model_rounds"] = 1
+    return main.pack_tool_batch(data, state, {}, calls, config, counter)
+
+
 def test_fine_only_has_no_community_signal(data, config):
-    s = main.make_sample_state(data, 0, "fine_only", CLASSES, config)
-    assert main.evidence(data, s, "fine", 1)["structure"]["same_community_as_target"] is None
-    with pytest.raises(main.CallError):
-        main.query(
-            data,
-            s,
-            copy.deepcopy(s),
-            call("search_1hop", {}),
-            {"center": "F:0", "k": 1, "coarse_checkpoint": {"prediction": "a"}},
-            config,
-            1,
-        )
+    state = main.make_sample_state(data, 0, "fine_only", CLASSES, config)
+    assert main.evidence(data, state, "fine", 1)["structure"]["same_community_as_target"] is None
+    final, results = pack(data, config, [call("search_1hop", search("C:999"))], state)
+    assert results[0]["by_source"][0]["status"] == "mode_forbidden"
+    assert final["seen_coarse"] == [] and final["counts"]["graph_tool_calls"] == 0
 
 
-def test_same_parameters_are_continuation(data, config):
-    s = main.make_sample_state(data, 0, "multi", CLASSES, config)
-    start = copy.deepcopy(s)
-    c = call("search_1hop", {})
-    args = search("C:0")
-    first = main.query(data, s, start, c, args, config, 1)[0]
-    second = main.query(data, s, start, c, args, config, 1)[0]
-    assert first["new_evidence"][0]["ref"] == "C:1" and second["new_evidence"][0]["ref"] == "C:2"
-    assert first["new_evidence"][0]["structure"]["similarity_to_target"] == 0.9
-    assert first["by_source"][0]["new_edges"][0]["weight"] == 1
-    assert s["counts"]["graph_tool_calls"] == 2
-
-
-def test_target_is_seen_and_known_edge_does_not_take_new_k(data, config):
-    s = main.make_sample_state(data, 0, "fine_only", CLASSES, config)
-    s["seen_fine"].append(1)
-    s["first_seen_step"]["F:1"] = 1
-    result = main.query(
-        data,
-        s,
-        copy.deepcopy(s),
-        call("search_1hop", {}),
-        search("F:1"),
-        config,
-        2,
-    )[0]
-    assert result["new_evidence"][0]["ref"] == "F:2" and result["already_read"][0]["ref"] == "F:0"
-
-
-def test_coarse_gate_is_round_start_based(data, config):
-    s = main.make_sample_state(data, 0, "multi", CLASSES, config)
-    s["counts"]["model_rounds"] = 1
-    calls = [
-        call("search_1hop", search("C:0")),
-        call("search_1hop", search("F:0"), id="call_2", index=1),
-        call("search_1hop", search("C:0", k=0), id="call_3", index=2),
-    ]
-    with pytest.raises(main.CallError) as raised:
-        main.pack_tool_batch(data, s, {}, calls, config, lambda _: 1, True)
-    assert [issue["message"] for issue in raised.value.issues] == [
-        "Read coarse evidence before fine query", "Invalid k"
-    ]
-    assert s["seen_coarse"] == [0] and s["counts"]["graph_tool_calls"] == 0
-    coarse, _, _ = main.pack_tool_batch(data, s, {}, calls[:1], config, lambda _: 1, True)
-    assert coarse["fine_access_reason"] == "coarse_evidence"
-    coarse["counts"]["model_rounds"] = 2
-    fine, results, _ = main.pack_tool_batch(
-        data, coarse, {}, calls[1:2], {**config, "AGENT_SHOW_SIMILARITY": "false"},
-        lambda _: 1, True,
-    )
-    assert fine["first_fine_request_round"] == 2
-    assert results[0]["new_evidence"][0]["ref"] == "F:1"
-    assert "similarity_to_target" not in results[0]["new_evidence"][0]["structure"]
-
-
-def test_id_repair_never_falsely_claims_next_page_read(data, config):
-    s = main.make_sample_state(data, 0, "multi", CLASSES, config)
-    calls = [
-        call("search_1hop", search("C:0")),
-        call("search_1hop", search("C:0"), index=1),
-    ]
-    with pytest.raises(main.CallError):
-        main.pack_tool_batch(data, s, {}, copy.deepcopy(calls), config, lambda _: 1, True)
-    final, results, debug = main.pack_tool_batch(
-        data, s, {}, calls, config, lambda _: 1, False
-    )
+@pytest.mark.parametrize("name,args,expected", [
+    ("search_1hop", {"queries": [{"center": "C:0", "k": 1}]}, "C:1"),
+    ("search_1hop", {"queries": [{"center": "F:0", "k": 1}]}, "F:1"),
+    ("expand_community", {"queries": [{"community": "C:0", "k": 1}]}, "F:1"),
+])
+def test_multi_allows_each_graph_action_on_first_round(data, config, name, args, expected):
+    state = main.make_sample_state(data, 0, "multi", CLASSES, config)
+    assert set(main.allowed(data, state, config)[0]) == {"submit", "search_1hop", "expand_community"}
+    assert '"similarity_to_target":1.0' in state["messages"][1]["content"]
+    state["counts"]["model_rounds"] = 1
+    final, results = pack(data, config, [call(name, args)], state)
+    assert results[0]["new_evidence"][0]["ref"] == expected
     assert final["counts"]["graph_tool_calls"] == 1
-    assert (
-        results[1]["error"]["code"] == "DUPLICATE_CALL_ID"
-        and not results[1]["already_read"]
-        and debug["id_mapping"]
-    )
 
 
-def test_expand_consumes_shared_budget(data, config):
-    s = main.make_sample_state(data, 0, "multi", CLASSES, config)
-    s["fine_access_reason"] = "coarse_evidence"
-    args = {
-        "community": "C:0",
-        "k": 1,
-    }
-    result = main.query(
-        data, s, copy.deepcopy(s), call("expand_community", {}), args, config, 1
-    )[0]
-    assert (
-        result["spent"]["graph_tool_calls"] == 1
-        and result["spent"]["center_queries"] == 0
-        and s["first_fine_request_round"] == 1
-        and "coarse_checkpoint" not in s
-    )
+def test_mixed_queries_validate_individually_and_can_page_next_round(data, config):
+    calls = [call("search_1hop", {"queries": [
+        {"center": "F:0", "k": 1}, {"center": "F:1", "k": 1},
+        {"center": "C:0", "k": 1}, {"center": "C:0", "k": 1},
+        {"center": "F:0", "k": 1},
+    ]})]
+    state, results = pack(data, config, calls)
+    assert [r["status"] for r in results[0]["by_source"]] == [
+        "ok", "invalid_center", "ok", "duplicate", "round_limit",
+    ]
+    coarse = results[0]["by_source"][2]["items"][0]
+    assert coarse == {"ref": "C:1", "weight": 1, "similarity_to_target": 0.9}
+    assert state["counts"]["graph_tool_calls"] == 2
+    state["counts"]["model_rounds"] += 1
+    next_call = call("search_1hop", {"queries": [
+        {"center": "C:0", "k": 1}, {"center": "F:1", "k": 1},
+    ]}, id="next")
+    _, results = pack(data, config, [next_call], state)
+    assert [r["ref"] for r in results[0]["new_evidence"]] == ["C:2", "F:2"]
+    assert len(results[0]["by_source"][1]["items"]) == 1
+    assert not results[0]["already_read"]
+
+
+def test_mixed_native_calls_keep_membership_and_duplicate_relation(data, config):
+    state = main.make_sample_state(data, 0, "multi", CLASSES, config)
+    state["counts"]["model_rounds"] = 1
+    state["seen_coarse"].append(1)
+    state["first_seen_step"]["C:1"] = 0
+    calls = [
+        call("expand_community", {"queries": [{"community": "C:0", "k": 1}, {"community": "C:1", "k": 1}]}),
+        call("search_1hop", search("F:0"), id="other", index=1),
+    ]
+    final, results = pack(data, config, calls, state)
+    assert [r["source"] for r in results[0]["by_source"]] == ["C:0", "C:1"]
+    assert [r["ref"] for r in results[0]["new_evidence"]] == ["F:1", "F:2"]
+    assert results[0]["by_source"][0]["items"] == [{"ref": "F:1", "similarity_to_target": 0.9}]
+    assert results[1]["by_source"][0]["items"] == [
+        {"ref": "F:1", "similarity_to_target": 0.9, "weight": 1}
+    ]
+    assert results[1]["already_read"][0]["ref"] == "F:1"
+    assert not results[1]["new_evidence"] and final["counts"]["graph_tool_calls"] == 3
+
+
+def test_empty_uses_budget_exhausted_and_skipped_do_not(data, config):
+    data["fine_adj"][0] = []
+    config["AGENT_MAX_GRAPH_TOOL_CALLS"] = "2"
+    state, results = pack(data, config, [call("search_1hop", search("F:0"))])
+    row = results[0]["by_source"][0]
+    assert row["status"] == "empty" and row["executed"]
+    state["counts"]["model_rounds"] += 1
+    calls = [
+        call("search_1hop", {"queries": [{"center": "F:0", "k": 1}, {"center": "C:0", "k": 1}]}),
+        call("expand_community", {"queries": [{"community": "C:0", "k": 1}]}, id="new", index=1),
+    ]
+    final, results = pack(data, config, calls, state)
+    assert [r["status"] for r in results[0]["by_source"]] == ["exhausted", "ok"]
+    assert results[1]["by_source"][0]["status"] == "budget_exhausted"
+    assert final["counts"]["graph_tool_calls"] == 2
+    assert final["counts"]["empty_queries"] == 2 and final["counts"]["skipped_queries"] == 1
 
 
 def test_capacity_rollback_does_not_pollute_seen(data, config):
-    s = main.make_sample_state(data, 0, "fine_only", CLASSES, config)
-    calls = [call("search_1hop", search("F:0"))]
-    # Every tool response is too big, but the earlier original history remains usable.
-    counter = lambda messages: 100000 if any(m["role"] == "tool" for m in messages) else 1
-    final, _, debug = main.pack_tool_batch(data, s, {}, calls, config, counter, True)
-    assert final is None and debug["code"] == "CONTEXT_REPLAN" and s["seen_fine"] == [0]
+    state = main.make_sample_state(data, 0, "fine_only", CLASSES, config)
+    counter = lambda history: 100000 if any(m["role"] == "tool" for m in history) else 1
+    final, _ = pack(data, config, [call("search_1hop", search("F:0"))], state, counter)
+    assert final is None and state["seen_fine"] == [0]
+
+
+def test_capacity_keeps_delivered_prefix_and_releases_deferred_budget(data, config):
+    def counter(history):
+        text = "".join(m["content"] for m in history if m["role"] == "tool")
+        return 100000 if "complete fine text 1" in text else 1
+
+    tools = [call("search_1hop", {"queries": [
+        {"center": "C:0", "k": 1}, {"center": "F:0", "k": 1},
+    ]})]
+    state, results = pack(data, config, tools, counter=counter)
+    assert [row["status"] for row in results[0]["by_source"]] == ["ok", "context_limited"]
+    assert state["seen_coarse"] == [0, 1] and state["seen_fine"] == [0]
+    assert not state["neighbor_sent"].get("fine:0")
+    assert state["counts"]["graph_tool_calls"] == 1
 
 
 def test_mixed_valid_submit_precedes_bad_query_id(data, config, tmp_path, monkeypatch):
@@ -350,7 +345,7 @@ def test_mixed_valid_submit_precedes_bad_query_id(data, config, tmp_path, monkey
         store, "sample", task, data, config, CLASSES, main.tool_schemas(CLASSES), lambda _: 1
     )
     assert task["status"] == "submitted" and task["state"]["counts"]["graph_tool_calls"] == 0
-    assert json.loads(task["state"]["messages"][-2]["content"])["status"] == "SKIPPED_AFTER_SUBMIT"
+    assert json.loads(task["state"]["messages"][-2]["content"])["status"] == "skipped_after_submit"
 
 
 def test_missing_tasks_do_not_enter_method_intersection():
@@ -434,9 +429,7 @@ def test_overlarge_first_candidate_does_not_starve_smaller_neighbor(data, config
         )
         else 1
     )
-    final, results, _ = main.pack_tool_batch(
-        data, s, {}, [call("search_1hop", search("F:1"))], config, counter, True
-    )
+    final, results = pack(data, config, [call("search_1hop", search("F:1"))], s, counter)
     assert (
         final is not None
         and results[0]["new_evidence"][0]["ref"] == "F:4"
@@ -499,14 +492,13 @@ def test_round_thirteen_can_query_and_fourteen_must_submit(
         assert store.db.execute("SELECT data FROM failures").fetchone() is not None
         main.handle_round(store, "t", task, data, config, CLASSES, tools, lambda _: 1)
         assert [p["tool_choice"] for p in payloads] == ["auto"] * 3
-        assert payloads[1]["messages"] == payloads[2]["messages"][:-1]
-        assert "上次未收到有效提交" in payloads[2]["messages"][-1]["content"]
-        assert payloads[2]["messages"][-1] not in task["state"]["messages"]
+        assert payloads[2]["messages"][:len(payloads[1]["messages"])] == payloads[1]["messages"]
+        assert "按工具协议重新输出" in payloads[2]["messages"][-1]["content"]
     else:
         assert [p["tool_choice"] for p in payloads] == ["required"] * 2
     assert all(p["tools"] == tools for p in payloads)
     assert payloads[-1]["messages"][: len(payloads[0]["messages"])] == payloads[0]["messages"]
-    assert payloads[-1]["messages"][-2 if remote else -1] == {
+    assert payloads[-1]["messages"][-4 if remote else -1] == {
         "role": "user", "content": "请立刻根据已有信息提交"
     }
     assert task["submit_trigger"] == "round_limit"
@@ -526,41 +518,59 @@ def test_uncommitted_kill_rolls_back_and_operation_is_idempotent(tmp_path):
     assert store.task("t")["prediction"] == "a"
 
 
-def test_repeat_invalid_coarse_center_keeps_retry_feedback_out_of_trace(
-    data, config, tmp_path, monkeypatch
-):
-    payloads = []
-    store = Store(tmp_path / "audit.sqlite")
-    key = "0:coarse_only:0"
-    task = {
-        "status": "running", "mode": "coarse_only", "target_id": 0, "repeat_id": 0,
-        "state": main.make_sample_state(data, 0, "coarse_only", CLASSES, config),
-    }
-    tools = main.tool_schemas(CLASSES, config)
-
+def test_invalid_batch_item_returns_normal_feedback_without_repair(data, config, tmp_path, monkeypatch):
+    received = []
+    state = main.make_sample_state(data, 0, "multi", CLASSES, config)
+    task = {"status": "running", "mode": "multi", "target_id": 0, "repeat_id": 0, "state": state}
+    calls = [
+        call("search_1hop", {"queries": [{"center":"C:0","k":1}, {"center":"F:5","k":1}]}),
+        call("expand_community", {"queries":[{"community":"C:0","k":1}]}, id="call_1", index=1),
+    ]
     def fake(store, c, prefix, key, step, generation, payload):
-        payloads.append(payload)
-        item = (
-            call("search_1hop", search("F:0"), id="wrong_center") if step == 1
-            else call("submit", {"prediction": "a", "reason": "done", "evidence_ids": ["F:0"]})
-        )
-        message = main.assistant_message({}, [item])
-        return {"choices": [{"message": message}]}, f"{step}-{generation}"
+        received.append(payload)
+        batch = calls if step == 1 else [call("submit", {
+            "prediction":"a", "reason":"done", "evidence_ids":["F:0","F:999"]
+        })]
+        return {"choices":[{"message":main.assistant_message({}, batch)}]}, "attempt"
+    monkeypatch.setattr(main,"request_model", fake)
+    store = Store(tmp_path / "audit.sqlite")
+    tools = main.tool_schemas(CLASSES, config)
+    for _ in range(2):
+        main.handle_round(store, "0:multi:0", task, data, config, CLASSES, tools, lambda _: 1)
+    assert len(received) == 2 and task["status"] == "submitted"
+    first = json.loads(store.db.execute("SELECT data FROM events ORDER BY key").fetchone()[0])
+    assert first["event_status"] == "tool_partial" and first["generation_index"] == 0
+    assert first["new_evidence_count"] == 2 and task["state"]["counts"]["graph_tool_calls"] == 2
+    assert len(first["id_mapping"]) == 1
+    assert task["evidence_ids"] == ["F:0"]
+    history = received[1]["messages"]
+    assert history[:2] == received[0]["messages"] and received[0]["tools"] == received[1]["tools"]
+    assert [x["id"] for x in history[-3]["tool_calls"]] == [x["tool_call_id"] for x in history[-2:]]
 
-    monkeypatch.setattr(main, "request_model", fake)
-    main.handle_round(store, key, task, data, config, CLASSES, tools, lambda _: 1)
-    task = store.task(key)
-    assert task["active"]["generation"] == 1
-    main.handle_round(store, key, task, data, config, CLASSES, tools, lambda _: 1)
-    assert payloads[0]["messages"] == payloads[1]["messages"][:-1]
-    assert "C:0" in payloads[1]["messages"][-1]["content"]
-    state = task["state"]
-    assert state["counts"]["graph_tool_calls"] == 0 and state["counts"]["tool_failed_rounds"] == 1
-    assert payloads[1]["messages"][-1] not in state["messages"]
-    event = json.loads(store.db.execute("SELECT data FROM events").fetchone()[0])
-    assert event["event_status"] == "tool_failed" and event["new_evidence_count"] == 0
-    main.handle_round(store, key, task, data, config, CLASSES, tools, lambda _: 1)
-    assert task["status"] == "submitted" and task["submit_after_failed_tool_round"]
+
+@pytest.mark.parametrize("first", [
+    {"content":"plain text"},
+    {"tool_calls":"unparseable"},
+    {"tool_calls":[{"id":"sub","function":{"name":"submit","arguments":"{}"}}]},
+])
+def test_unusable_output_repairs_once_then_stops(data, config, tmp_path, monkeypatch, first):
+    received = []
+    def fake(store, c, prefix, key, step, generation, payload):
+        received.append(payload)
+        return {"choices":[{"message":first}]}, f"attempt-{generation}"
+    monkeypatch.setattr(main,"request_model", fake)
+    store = Store(tmp_path / "audit.sqlite")
+    task = {"status":"running", "mode":"multi", "target_id":0, "repeat_id":0,
+            "state":main.make_sample_state(data, 0, "multi", CLASSES, config)}
+    tools = main.tool_schemas(CLASSES, config)
+    for _ in range(2):
+        main.handle_round(store, "0:multi:0", task, data, config, CLASSES, tools, lambda _: 1)
+    assert len(received) == 2 and task["status"] == "protocol_failure"
+    assert task["state"]["counts"]["model_rounds"] == 1
+    assert task["state"]["counts"]["graph_tool_calls"] == 0
+    assert received[1]["messages"][:2] == received[0]["messages"]
+    assert received[1]["messages"][-1]["content"].startswith("请按工具协议")
+    assert received[1]["tools"] == received[0]["tools"]
 
 
 def test_evaluation_import_never_initializes_torch():
@@ -739,19 +749,6 @@ def test_cached_and_unknown_cost_denominators_stay_separate():
     assert result["paired_rows"][0]["total_tokens_mean_difference"] == -101
 
 
-def test_same_source_batch_progress_is_final_and_placeholders_are_grounded(data, config):
-    s = main.make_sample_state(data, 0, "multi", CLASSES, config)
-    calls = [
-        call("search_1hop", search("C:0")),
-        call("search_1hop", search("C:0"), id="call_2", index=1),
-    ]
-    final, results, _ = main.pack_tool_batch(data, s, {}, calls, config, lambda _: 1, True)
-    assert final["seen_coarse"] == [0, 1, 2]
-    assert all(
-        not r["by_source"][0]["has_more"] and not r["by_source"][0]["has_more_new"] for r in results
-    )
-
-
 def test_readable_model_url_cannot_embed_credentials(tmp_path):
     from experiment_io import load_env
 
@@ -780,9 +777,9 @@ def test_public_model_config_cannot_point_to_private_file(tmp_path):
         load_env(path)
 
 
-@pytest.mark.parametrize("thinking,query_count", [(False, 1), (True, 2)])
+@pytest.mark.parametrize("thinking", [False, True])
 def test_deepseek_relay_tool_round_trip(
-    remote_config, tmp_path, monkeypatch, thinking, query_count
+    remote_config, tmp_path, monkeypatch, thinking
 ):
     import httpx
     from experiment_io import load_env
@@ -807,57 +804,35 @@ def test_deepseek_relay_tool_round_trip(
         assert payload["thinking"]["type"] == ("enabled" if thinking else "disabled")
         assert ("temperature" in payload) != thinking
         assert payload["tool_choice"] == "auto"
-        if len(payloads) == 1:
-            calls = [
-                {
-                    "id": f"call_{i}",
-                    "type": "function",
-                    "function": {
-                        "name": "search_1hop",
-                        "arguments": json.dumps(search("C:0" if i == 0 else "F:1")),
-                    },
-                }
-                for i in range(query_count)
-            ]
-            message = {"role": "assistant", "content": None, "tool_calls": calls}
-            if thinking:
-                message["reasoning_content"] = "synthetic reasoning marker"
-        else:
+        step = len(payloads)
+        if step > 1:
             history = payload["messages"]
-            assert [msg["role"] for msg in history] == ["system", "user", "assistant"] + [
-                "tool"
-            ] * query_count + ["user"]
-            assert [msg["tool_call_id"] for msg in history[3:-1]] == [
-                f"call_{i}" for i in range(query_count)
-            ]
-            assert all(isinstance(msg["content"], str) for msg in history[3:-1])
+            assert history[:len(payloads[-2]["messages"])] == payloads[-2]["messages"]
+            assert [msg["role"] for msg in history[-3:]] == ["assistant", "tool", "user"]
+            assert history[-2]["tool_call_id"] == f"call_{step - 1}"
+            assert isinstance(history[-2]["content"], str)
             if thinking:
-                assert history[2]["reasoning_content"] == "synthetic reasoning marker"
-            assert main.FORCE_SUBMIT == history[-1]["content"]
+                assert history[-3]["reasoning_content"] == "synthetic reasoning marker"
             assert payload["tools"] == payloads[0]["tools"]
-            message = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "answer",
-                        "type": "function",
-                        "function": {
-                            "name": "submit",
-                            "arguments": json.dumps(
-                                {"prediction": "demo", "reason": "probe", "evidence_ids": []}
-                            ),
-                        },
-                    }
-                ],
-            }
+        if step == 1:
+            name = "search_1hop"
+            args = {"queries": [{"center": "C:0", "k": 1}, {"center": "F:1", "k": 1}]}
+        elif step == 2:
+            name = "expand_community"
+            args = {"queries": [{"community": "C:0", "k": 1}, {"community": "C:1", "k": 1}]}
+        else:
+            name = "submit"
+            args = {"prediction": "a", "reason": "probe", "evidence_ids": []}
+        message = main.assistant_message({}, [call(name, args, id=f"call_{step}")])
+        if thinking:
+            message["reasoning_content"] = "synthetic reasoning marker"
         return httpx.Response(200, json={"choices": [{"message": message}]})
 
     monkeypatch.setattr(httpx, "get", reject_models_lookup)
     monkeypatch.setattr(httpx, "post", post)
     main.verify_tool_capability(store, config, CLASSES, tool_schemas, counter)
-    assert len(payloads) == 2
-    assert store.meta("remote_tool_capabilities")["multiple_calls_observed"] == (query_count == 2)
+    assert len(payloads) == 3
+    assert store.meta("remote_tool_capabilities")["batched_queries_verified"]
 
 
 def test_deepseek_flags_ignored_thinking_toggle(remote_config):

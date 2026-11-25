@@ -18,7 +18,7 @@ import uuid
 
 VERSION = 3
 ALGORITHM = "multigrain-v3.1"
-AGENT_ALGORITHM = "multigrain-agent-v3.4"
+AGENT_ALGORITHM = "multigrain-agent-v3.5"
 TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -338,6 +338,7 @@ def stage_fingerprint(c, stage):
         and not k.endswith(runtime_suffixes)
         and not (k.endswith("_MODEL_MODE") and v == "local")
         and not (k == "AGENT_TARGET_PLAN" and not v)
+        and k not in {"AGENT_MAX_CENTER_QUERIES", "AGENT_MAX_DISTINCT_COMMUNITIES", "AGENT_SHOW_SIMILARITY"}
         and not (
             c.get("AGENT_TARGET_PLAN")
             and k in {"AGENT_TARGET_SPLIT", "AGENT_TARGET_LIMIT", "AGENT_TARGET_SEED"}
@@ -407,20 +408,23 @@ class Store:
         if initialize:
             self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
-        if not initialize:
-            return
-        self.db.executescript("""
+        if initialize:
+            self.db.executescript("""
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS tasks(key TEXT PRIMARY KEY,status TEXT NOT NULL,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY,owner TEXT NOT NULL,step INTEGER NOT NULL,
             generation INTEGER NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL,response TEXT,usage TEXT,
-            error TEXT,latency REAL,rejected INTEGER NOT NULL DEFAULT 0);
+            error TEXT,latency REAL,rejected INTEGER NOT NULL DEFAULT 0,
+            recovery_index INTEGER NOT NULL DEFAULT 0, transport_index INTEGER NOT NULL DEFAULT 0);
           CREATE INDEX IF NOT EXISTS request_lookup ON requests(owner,step,generation);
           CREATE TABLE IF NOT EXISTS events(key TEXT PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS failures(id TEXT PRIMARY KEY,data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS artifacts(key TEXT PRIMARY KEY,data TEXT NOT NULL);
         """)
-        self.db.commit()
+            self.db.commit()
+        self.request_metadata = any(
+            r["name"] == "recovery_index" for r in self.db.execute("PRAGMA table_info(requests)")
+        )
 
     @contextlib.contextmanager
     def tx(self):
@@ -513,6 +517,16 @@ class Store:
                 entry = dict(row)
                 for key in ("payload", "response", "usage"):
                     entry[key] = json.loads(entry[key]) if entry[key] else None
+                if "transport_index" in entry:
+                    entry["request_type"] = (
+                        "transport_retry" if entry["transport_index"]
+                        else "protocol_repair" if entry["generation"] else "decision"
+                    )
+                    if entry["owner"].startswith("capability:"):
+                        entry["request_type"] = "capability_" + entry["request_type"]
+                entry["usage_missing"] = not any(
+                    (entry["usage"] or {}).get(key) is not None for key in TOKEN_FIELDS
+                )
                 yield entry
 
         write_jsonl(folder / "requests.jsonl", request_rows())
@@ -543,7 +557,9 @@ def result_for_task(db, key, task, include_trace=True):
             result[field] = state[field]
     counts = dict(state.get("counts", {}))
     rows = db.execute(
-        "SELECT step,generation,rejected FROM requests WHERE owner=?", (key,)
+        """SELECT step,generation,rejected,latency,
+                  json_array_length(response,'$.choices[0].message.tool_calls') AS tool_calls
+           FROM requests WHERE owner=? AND status <> 'prepared'""", (key,)
     ).fetchall()
     counts.update(
         request_attempts=len(rows),
@@ -554,6 +570,21 @@ def result_for_task(db, key, task, include_trace=True):
         distinct_fine_centers=len(state.get("queried_centers", {}).get("fine", [])),
         distinct_coarse_centers=len(state.get("queried_centers", {}).get("coarse", [])),
     )
+    if "sample_runs" in task or "invalid_queries" in counts:
+        generations = {(r["step"], r["generation"]) for r in rows}
+        coarse_centers = set(state.get("queried_centers", {}).get("coarse", []))
+        counts.update(
+            api_attempts=len(rows),
+            api_retries=len(rows) - len(generations),
+            repair_attempts=sum(generation > 0 for _, generation in generations),
+            tool_calls=sum(r["tool_calls"] or 0 for r in rows),
+            logical_queries=counts.get("graph_tool_calls", 0),
+            sample_recoveries=max(0, task.get("sample_runs", 0) - 1),
+            distinct_accessed_coarse_nodes=len(coarse_centers.union(state.get("opened_communities", []))),
+            distinct_accessed_fine_nodes=counts["distinct_fine_centers"],
+        )
+        latencies = [r["latency"] for r in rows if r["latency"] is not None]
+        result["reported_request_latency_seconds"] = sum(latencies) if latencies else None
     result["counts"] = counts
     if task["status"] == "submitted" and "evidence_ids" in task and "first_seen_step" in state:
         refs = task["evidence_ids"]
@@ -571,11 +602,11 @@ def result_for_task(db, key, task, include_trace=True):
 
 def usage_for(db, owner=None, *, capability_only=False):
     sql = """SELECT status,usage,rejected,json_extract(response, '$.choices[0].finish_reason') AS finish_reason
-             FROM requests"""
+             FROM requests WHERE status <> 'prepared'"""
     if capability_only:
-        rows = db.execute(sql + " WHERE owner LIKE 'capability:%'").fetchall()
+        rows = db.execute(sql + " AND owner LIKE 'capability:%'").fetchall()
     elif owner is not None:
-        rows = db.execute(sql + " WHERE owner=?", (owner,)).fetchall()
+        rows = db.execute(sql + " AND owner=?", (owner,)).fetchall()
     else:
         rows = db.execute(sql).fetchall()
     sums = dict.fromkeys(TOKEN_FIELDS, 0)
@@ -917,15 +948,28 @@ def request_model(store, c, prefix, owner, step, generation, payload):
     url = base + "/chat/completions"
     limiter = c.get("_api_limiter")
     reserve = len(dumps(payload).encode("utf-8")) + (payload.get("max_tokens") or 0)
+    previous_attempts = store.db.execute(
+        """SELECT count(*) FROM requests
+           WHERE owner=? AND step=? AND generation=? AND status <> 'prepared'""",
+        (owner, step, generation),
+    ).fetchone()[0]
     for attempt in range(integer(c, prefix + "_MAX_HTTP_ATTEMPTS", 5, 1)):
         if limiter is not None:
             limiter.acquire(reserve)
         aid = uuid.uuid4().hex
         with store.tx() as db:
-            db.execute(
-                "INSERT INTO requests(id,owner,step,generation,status,payload) VALUES(?,?,?,?,?,?)",
-                (aid, owner, step, generation, "prepared", dumps(safe_payload)),
-            )
+            fields = (aid, owner, step, generation, "prepared", dumps(safe_payload))
+            if store.request_metadata:
+                db.execute(
+                    """INSERT INTO requests(id,owner,step,generation,status,payload,recovery_index,
+                       transport_index) VALUES(?,?,?,?,?,?,?,?)""",
+                    (*fields, c.get("_sample_recovery", 0), previous_attempts + attempt),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO requests(id,owner,step,generation,status,payload) VALUES(?,?,?,?,?,?)",
+                    fields,
+                )
         with store.tx() as db:
             db.execute("UPDATE requests SET status='sent' WHERE id=?", (aid,))
         started = time.monotonic()
@@ -945,6 +989,12 @@ def request_model(store, c, prefix, owner, step, generation, payload):
             )
             if not response.is_success:
                 diagnostic = {"http_status": response.status_code}
+                try:
+                    error_body = response.json()
+                except ValueError:
+                    error_body = None
+                raw_usage = error_body.get("usage") if isinstance(error_body, dict) else None
+                usage = normalize_usage(redact(raw_usage)) if raw_usage is not None else None
                 if not remote:
                     diagnostic.update(
                         body=response.text,
@@ -953,10 +1003,12 @@ def request_model(store, c, prefix, owner, step, generation, payload):
                     )
                 with store.tx() as db:
                     db.execute(
-                        "UPDATE requests SET response=? WHERE id=?",
-                        (dumps(redact(diagnostic)), aid),
+                        "UPDATE requests SET response=?,usage=? WHERE id=?",
+                        (dumps(redact(diagnostic)), dumps(usage) if usage is not None else None, aid),
                     )
-            if response.status_code in (408, 429) or response.status_code >= 500:
+            if response.status_code in (408, 429) or (
+                response.status_code >= 500 and response.status_code not in (501, 505)
+            ):
                 http_status = response.status_code
                 wait = retry_delay(response, wait, integer(c, "RETRY_MAX_WAIT_SECONDS", 60, 1))
                 if limiter is not None and http_status == 429:
