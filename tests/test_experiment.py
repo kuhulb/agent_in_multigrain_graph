@@ -476,10 +476,22 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
     assert payload["tool_choice"] == "auto" and payload["tools"] == tools
     assert [tool["function"]["name"] for tool in tools] == ["search_1hop", "expand_community", "submit"]
     system = payload["messages"][0]["content"]
-    assert system == main.system_prompt(CLASSES, mode)
-    assert system.endswith(main.MODE_STRATEGIES[mode])
-    assert "候选类别：\na: A\nb: B" in system
-    assert "Neighbors" not in system and "queries" not in system and "k越小" not in system
+    strategies = {
+        "target_only": "仅根据目标节点的文本属性进行分类，直接提交预测结果，不进行任何图查询。",
+        "fine_only": "若当前证据不足，仅允许查询已见原始节点（F）的邻居。禁止查询粗节点或展开超节点。",
+        "coarse_only": "若当前证据不足，仅允许查询已见超节点（C）的邻居。禁止查询原始节点或展开超节点。",
+        "multi": (
+            "若当前证据不足，优先查询粗粒度图中的邻居。若粗粒度证据仍然不足，可展开超节点或查询原始图中的邻居，获取更具体的证据。\n\n"
+            "超节点摘要可能丢失局部细节，也可能包含与目标节点无关的信息。不同粒度的证据可以互相补充，但不必同时获取。"
+        ),
+    }
+    assert system == (
+        "你的任务是判断目标节点所属的类别。\n\n"
+        "以目标节点自身的文本属性为主要分类依据，其他节点的信息仅用于辅助判断。"
+        "邻居节点或超节点的主题不一定与目标节点的类别一致，结构信息和语义相似度不能直接作为分类依据。\n\n"
+        "若当前证据充足，则直接提交预测结果；否则，针对尚不明确的类别寻找补充证据。避免获取无关或重复的信息。\n\n"
+        f"候选类别：\na: A\nb: B\n\n{strategies[mode]}"
+    )
     user = payload["messages"][1]["content"]
     assert user.startswith("Target F:0") and data["fine_texts"][0] in user
     assert ("Community C:0" in user) == (mode in ("coarse_only", "multi"))
@@ -955,12 +967,14 @@ def test_deepseek_relay_tool_round_trip(
     remote_config, tmp_path, monkeypatch, thinking
 ):
     import httpx
-    from experiment_io import load_env
+    from experiment_io import configure_agent_low_thinking, load_env, stage_fingerprint
 
-    public, profile = remote_config
-    if thinking:
-        profile.write_text(profile.read_text() + "AGENT_API_ENABLE_THINKING=true\n")
+    public, _ = remote_config
     config = load_env(public, model_stage="AGENT")
+    off_fingerprint = stage_fingerprint(config, "agent")
+    if thinking:
+        configure_agent_low_thinking(config)
+        assert stage_fingerprint(config, "agent") != off_fingerprint
     tool_schemas = main.tool_schemas(CLASSES, config)
     counter = main.TokenCounter(config, tool_schemas)
     store = Store(tmp_path / "probe.sqlite")
@@ -975,6 +989,7 @@ def test_deepseek_relay_tool_round_trip(
         assert url.endswith("/chat/completions")
         assert "parallel_tool_calls" not in payload and "seed" not in payload
         assert payload["thinking"]["type"] == ("enabled" if thinking else "disabled")
+        assert payload.get("reasoning_effort") == ("low" if thinking else None)
         assert ("temperature" in payload) != thinking
         assert payload["tool_choice"] == "auto"
         step = len(payloads)
@@ -1006,6 +1021,16 @@ def test_deepseek_relay_tool_round_trip(
     main.verify_tool_capability(store, config, CLASSES, tool_schemas, counter)
     assert len(payloads) == 3
     assert store.meta("remote_tool_capabilities")["batched_queries_verified"]
+
+
+def test_low_thinking_rejects_unsupported_adapter(remote_config):
+    from experiment_io import ConfigFailure, configure_agent_low_thinking, load_env
+
+    public, _ = remote_config
+    config = load_env(public, model_stage="AGENT")
+    config["_remote"]["adapter"] = "openai_compatible"
+    with pytest.raises(ConfigFailure, match="requires the DeepSeek API adapter"):
+        configure_agent_low_thinking(config)
 
 
 def test_deepseek_flags_ignored_thinking_toggle(remote_config):

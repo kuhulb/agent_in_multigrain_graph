@@ -18,7 +18,7 @@ import uuid
 
 VERSION = 3
 ALGORITHM = "multigrain-v3.1"
-AGENT_ALGORITHM = "multigrain-agent-v3.8"
+AGENT_ALGORITHM = "multigrain-agent-v3.9"
 TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -218,6 +218,7 @@ def load_remote_model(c, prefix):
     )
     c["_remote"] = {
         "stage": prefix,
+        "adapter": adapter,
         "base_url": private["BASE_URL"].rstrip("/"),
         "key": private["KEY"],
     }
@@ -864,13 +865,28 @@ def model_connection(c, prefix):
     return c[prefix + "_LLM_BASE_URL"].rstrip("/"), {}
 
 
+def configure_agent_low_thinking(c):
+    remote = c.get("_remote", {})
+    if (
+        c.get("AGENT_MODEL_MODE") != "api" or remote.get("stage") != "AGENT"
+        or remote.get("adapter") != "deepseek" or c.get("AGENT_THINKING_CONTROL") != "deepseek"
+        or c.get("_api_tool_choice") != "auto"
+    ):
+        raise ConfigFailure("Low Thinking requires the DeepSeek API adapter and auto tool choice")
+    c["AGENT_ENABLE_THINKING"] = "true"
+    c["AGENT_REASONING_EFFORT"] = "low"
+
+
 def thinking_params(c, prefix):
     enabled = boolean(c, prefix + "_ENABLE_THINKING")
     control = c.get(prefix + "_THINKING_CONTROL", "chat_template")
     if control == "chat_template":
         return {"chat_template_kwargs": {"enable_thinking": enabled}}
     if control == "deepseek":
-        return {"thinking": {"type": "enabled" if enabled else "disabled"}}
+        params = {"thinking": {"type": "enabled" if enabled else "disabled"}}
+        if prefix == "AGENT" and enabled and c.get("AGENT_REASONING_EFFORT") == "low":
+            params["reasoning_effort"] = "low"
+        return params
     if control == "non_thinking_model" and not enabled:
         return {}
     if control == "reasoning_effort_none" and not enabled:

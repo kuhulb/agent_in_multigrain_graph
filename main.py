@@ -28,6 +28,7 @@ from experiment_io import (
     api_runtime,
     bounded_jobs,
     config_path,
+    configure_agent_low_thinking,
     csv_values,
     digest,
     dumps,
@@ -48,17 +49,23 @@ from experiment_io import (
 MODES = {"target_only", "fine_only", "coarse_only", "multi"}
 TARGET_SPLITS = ("train", "val", "test")
 MODE_STRATEGIES = {
-    "multi": "若当前证据充足，则直接提交预测结果。若证据不足，优先在粗粒度图上寻找证据。若粗粒度证据仍然不足，可在原始图上进一步寻找证据。",
-    "fine_only": "若当前证据充足，则直接提交预测结果。若证据不足，仅在原始图上寻找证据。",
-    "coarse_only": "若当前证据充足，则直接提交预测结果。若证据不足，仅查询粗粒度图上的邻居，不获取原始节点证据。",
-    "target_only": "仅依据目标节点文本进行分类，并提交预测结果。",
+    "multi": (
+        "若当前证据不足，优先查询粗粒度图中的邻居。若粗粒度证据仍然不足，可展开超节点或查询原始图中的邻居，获取更具体的证据。\n\n"
+        "超节点摘要可能丢失局部细节，也可能包含与目标节点无关的信息。不同粒度的证据可以互相补充，但不必同时获取。"
+    ),
+    "fine_only": "若当前证据不足，仅允许查询已见原始节点（F）的邻居。禁止查询粗节点或展开超节点。",
+    "coarse_only": "若当前证据不足，仅允许查询已见超节点（C）的邻居。禁止查询原始节点或展开超节点。",
+    "target_only": "仅根据目标节点的文本属性进行分类，直接提交预测结果，不进行任何图查询。",
 }
 
 
 def system_prompt(classes, mode):
     labels = "\n".join(f"{row['class_id']}: {row['name']}" for row in classes)
     return (
-        "你的任务是根据已有证据，从候选类别中选择目标节点所属的类别。\n\n"
+        "你的任务是判断目标节点所属的类别。\n\n"
+        "以目标节点自身的文本属性为主要分类依据，其他节点的信息仅用于辅助判断。"
+        "邻居节点或超节点的主题不一定与目标节点的类别一致，结构信息和语义相似度不能直接作为分类依据。\n\n"
+        "若当前证据充足，则直接提交预测结果；否则，针对尚不明确的类别寻找补充证据。避免获取无关或重复的信息。\n\n"
         f"候选类别：\n{labels}\n\n{MODE_STRATEGIES[mode]}"
     )
 
@@ -1134,7 +1141,7 @@ def agent_payload(c, messages, tools, *, generation=0, seed=None, probe=False):
         payload["parallel_tool_calls"] = True
         if seed is not None:
             payload["seed"] = seed
-    if probe:
+    if probe and c.get("AGENT_REASONING_EFFORT") != "low":
         payload["max_tokens"] = min(payload["max_tokens"], 512)
     return payload
 
@@ -1144,7 +1151,7 @@ def verify_tool_capability(store, c, classes, tools, counter):
     from experiment_io import verify_deployment
 
     identity = verify_deployment(store, c, "AGENT")
-    capability_hash = digest([identity, counter.identity, "batched-tool-probe-v3"])
+    capability_hash = digest([identity, counter.identity, "batched-tool-probe-v3", thinking_params(c, "AGENT")])
     if store.meta("capability_verified") == capability_hash:
         return
     owner = "capability:agent:" + capability_hash[:16]
@@ -1558,6 +1565,7 @@ def run(c):
                 "schema_version": VERSION,
                 "experiment_id": c["EXPERIMENT_ID"],
                 "algorithm": AGENT_ALGORITHM,
+                "thinking_request": thinking_params(c, "AGENT"),
                 "git_commit_sha": store.meta("source_commit"),
                 "tool_schema_sha256": digest(tools),
                 "system_prompt_sha256_by_mode": {m: digest(text) for m, text in prompts.items()},
@@ -1600,8 +1608,11 @@ def main():
     parser.add_argument("--target-seed", type=int)
     parser.add_argument("--target-plan", help="Use an existing evaluation node plan")
     parser.add_argument("--experiment-id")
+    parser.add_argument("--reasoning-effort", choices=("low",), help="Opt in to DeepSeek Low Thinking")
     args = parser.parse_args()
     c = load_env(args.env, model_stage="AGENT")
+    if args.reasoning_effort == "low":
+        configure_agent_low_thinking(c)
     if args.experiment_id:
         c["EXPERIMENT_ID"] = args.experiment_id
     if args.target_plan:
