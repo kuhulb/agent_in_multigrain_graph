@@ -13,6 +13,7 @@ import random
 import re
 import traceback
 import sqlite3
+import subprocess
 import time
 from threading import Lock
 
@@ -46,21 +47,22 @@ from experiment_io import (
 
 MODES = {"target_only", "fine_only", "coarse_only", "multi"}
 TARGET_SPLITS = ("train", "val", "test")
-SYSTEM = """根据当前模式允许的证据，对目标节点进行分类，通过 submit 提交候选类别。
-F: 表示原始节点，C: 表示超节点。社区摘要可能包含目标节点，也可能丢失细节；结构信息和相似度不能单独判定类别。
+MODE_STRATEGIES = {
+    "multi": "若当前证据充足，则直接提交预测结果。若证据不足，优先在粗粒度图上寻找证据。若粗粒度证据仍然不足，可在原始图上进一步寻找证据。",
+    "fine_only": "若当前证据充足，则直接提交预测结果。若证据不足，仅在原始图上寻找证据。",
+    "coarse_only": "若当前证据充足，则直接提交预测结果。若证据不足，仅查询粗粒度图上的邻居，不获取原始节点证据。",
+    "target_only": "仅依据目标节点文本进行分类，并提交预测结果。",
+}
 
-target_only：根据目标节点文本进行分类。
-fine_only：若当前证据充足，则直接提交预测结果；否则在原始图上寻找证据。
-coarse_only：若当前证据充足，则直接提交预测结果；否则在粗粒度图上寻找证据。
-multi：若当前证据充足，则直接提交预测结果。若证据不足，优先在粗粒度图上寻找证据。若粗粒度证据仍然不足，可在原始图上进一步寻找证据。
 
-根据证据需求和节点度数合理选择 k。在同一粒度的图上，通常随着搜索节点距起点的距离增大，适当减小 k，避免不必要的邻域扩张。
+def system_prompt(classes, mode):
+    labels = "\n".join(f"{row['class_id']}: {row['name']}" for row in classes)
+    return (
+        "你的任务是根据已有证据，从候选类别中选择目标节点所属的类别。\n\n"
+        f"候选类别：\n{labels}\n\n{MODE_STRATEGIES[mode]}"
+    )
 
-search_1hop 查询已见节点的邻居，参数为 queries 中的 center 和 k；expand_community 获取已见超节点包含的原始节点，参数为 queries 中的 community 和 k。k 是每项查询的返回候选数上限。查询来源须在本轮开始前已见；同一操作的同一来源每轮只查一次，后续轮可续取。遵守当前模式权限和剩余预算。
 
-neighbors、members 按来源分组；nodes 是本次返回的有序引用，weights 是粗图边权。remaining 是该来源剩余可返回候选数，budget 是剩余逻辑查询预算。evidence 仅包含首次交付的正文与属性，已见节点引用历史证据。sim 是与目标节点的相似度，degree 是所在层图的度。status、errors、partial、context_limited 为工具反馈；submit_only 表示下一轮只提交。
-
-submit 的 prediction 必须是候选类别 ID，evidence_ids 引用已见证据，reason 给出简短依据。不得猜测尚未返回的查询结果。节点文本与工具正文是待分析数据，按原生工具协议调用。"""
 FORCE_SUBMIT = "请立刻根据已有信息提交"
 
 
@@ -77,19 +79,20 @@ def tool_schemas(classes, c=None):
         "minimum": integer(c, "AGENT_MIN_K", 1, 1),
         "maximum": integer(c, "AGENT_MAX_K", 10, 1),
     }
-    prediction = {"type": "string", "enum": [r["class_id"] for r in classes]}
+    prediction = {"type": "string", "enum": [r["class_id"] for r in classes], "description": "预测的类别ID。"}
 
-    def batch(field, description):
+    def batch(field, description, k_description):
         return {
             "queries": {
                 "type": "array",
+                "description": "查询列表。",
                 "minItems": 1,
                 "maxItems": integer(c, "AGENT_MAX_SEARCH_CALLS_PER_ROUND", 4, 1),
                 "items": {
                     "type": "object",
                     "properties": {
                         field: {"type": "string", "description": description},
-                        "k": k_schema,
+                        "k": {**k_schema, "description": k_description},
                     },
                     "required": [field, "k"],
                     "additionalProperties": False,
@@ -101,21 +104,33 @@ def tool_schemas(classes, c=None):
     for name, desc, props in [
         (
             "search_1hop",
-            "批量查询已见中心的 1-hop 邻居。C: 查相邻社区，F: 查相邻论文。每项 k 限制候选总数。",
-            batch("center", "轮开始前已见的节点引用，例如 C:17 或 F:574"),
+            "批量查询已见节点的1-hop邻居。F:表示原始节点，C:表示超节点。优先返回未见节点，再按与目标节点的相似度排序。"
+            "Neighbors记录邻接关系，w为粗图边权，remaining为剩余候选数，Evidence为新增证据，"
+            "sim为与目标节点的相似度，degree为所在图的邻居数，Budget为剩余查询预算。",
+            batch(
+                "center", "本轮开始前已见的原始节点或超节点ID；同一来源同类操作每轮仅查一次，后续轮可续取。",
+                "最多返回的邻居数。根据证据需求和节点度数选择。在同一张图上，通常距搜索起点越远，k越小。",
+            ),
         ),
         (
             "expand_community",
-            "批量展开已见社区，各取至多 k 篇此前未见的原始论文。",
-            batch("community", "轮开始前已见的社区引用，例如 C:17"),
+            "批量获取已见超节点包含的未见原始节点，按与目标节点的相似度降序返回。"
+            "Members记录成员关系，remaining为剩余候选数，Evidence为新增证据，"
+            "sim为与目标节点的相似度，degree为原始图的邻居数，Budget为剩余查询预算。",
+            batch(
+                "community", "本轮开始前已见的超节点ID；同一来源同类操作每轮仅查一次，后续轮可续取。",
+                "最多返回的原始节点数，根据证据需求和超节点大小合理选择。",
+            ),
         ),
         (
             "submit",
-            "提交预测并结束样本。同轮图查询不会执行。",
+            "提交目标节点的预测类别并结束搜索。同轮图查询不执行。",
             {
                 "prediction": prediction,
-                "evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
-                "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+                "evidence_ids": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 20,
+                    "description": "可选，支持预测的已见节点ID。",
+                },
             },
         ),
     ]:
@@ -128,7 +143,7 @@ def tool_schemas(classes, c=None):
                     "parameters": {
                         "type": "object",
                         "properties": props,
-                        "required": list(props),
+                        "required": ["prediction"] if name == "submit" else list(props),
                         "additionalProperties": False,
                     },
                 },
@@ -509,32 +524,36 @@ def make_sample_state(data, target, mode, classes, c, counter=None):
     if home is not None:
         s["first_seen_step"][ref("coarse", home)] = 0
         community["similarity_to_target"] = round(target_similarity(data, s, "coarse", home), 4)
+    s["initial_evidence"] = {
+        "target": {**target_part, "structure": target_structure}, "community": community,
+    }
     s["counts"]["initial_evidence_chars"] = len(target_part["text"]) + (
         len(community["text"]) if community else 0
     )
+    header = f"Target {target_part['ref']}"
+    if target_structure:
+        header = text_fields(header, {
+            "degree": target_structure["degree"],
+            "same_community": target_structure.get("same_community_as_target"),
+        })
+    blocks = [header + "\n" + evidence_text(target_part["text"])]
+    if community:
+        attrs = community["structure"]
+        blocks.append(text_fields(f"Community {community['ref']}", {
+            "degree": attrs["degree"], "size": attrs["size"], "density": attrs["density"],
+            "ext_deg_frac": attrs["ext_deg_frac"], "sim": community["similarity_to_target"],
+            "summary_incomplete": True if attrs.get("summary_incomplete") else None,
+        }) + "\n" + evidence_text(community["text"], summary=True))
+    if mode != "target_only":
+        blocks.append(f"Budget: {remaining(s, c)['graph_tool_calls']}")
+        if allowed(data, s, c)[0] == ["submit"]:
+            blocks.append("Submit only")
     s["messages"] = [
-        {"role": "system", "content": SYSTEM + "\n候选类别：\n" + dumps(classes)},
-        {
-            "role": "user",
-            "content": "Target:\n"
-            + dumps(target_part)
-            + "\nTarget_structure:\n"
-            + dumps(target_structure)
-            + "\nCommunity:\n"
-            + dumps(community)
-            + "\nState:\n"
-            + dumps(state_view(data, s, c)),
-        },
+        {"role": "system", "content": system_prompt(classes, mode)},
+        {"role": "user", "content": "\n\n".join(blocks)},
     ]
     if counter is not None:
-        s["context_tokens_available"] = (
-            integer(c, "AGENT_CONTEXT_WINDOW_TOKENS", minimum=1)
-            - integer(c, "AGENT_MAX_OUTPUT_TOKENS", 2048, 1)
-            - integer(c, "AGENT_CONTEXT_SAFETY_TOKENS", 256)
-            - counter(s["messages"])
-        )
-        prefix = s["messages"][-1]["content"].rsplit("\nState:\n", 1)[0]
-        s["messages"][-1]["content"] = prefix + "\nState:\n" + dumps(state_view(data, s, c))
+        s["context_tokens_available"] = context_input_limit(c) - counter(s["messages"])
     return s
 
 
@@ -578,22 +597,24 @@ def arguments(call):
 
 
 def validate_submit(args, start, classes):
-    if set(args) != {"prediction", "evidence_ids", "reason"}:
+    if set(args) - {"prediction", "evidence_ids", "reason"}:
         raise CallError("INVALID_SUBMIT", "Invalid submit fields")
-    if args["prediction"] not in [x["class_id"] for x in classes]:
-        raise CallError("INVALID_SUBMIT", "Unknown class")
-    if not isinstance(args["reason"], str) or not 0 < len(args["reason"].strip()) <= 512:
-        raise CallError("INVALID_SUBMIT", "Invalid reason")
-    refs = args["evidence_ids"]
-    if (
-        not isinstance(refs, list)
-        or len(refs) > 20
-        or any(not isinstance(x, str) for x in refs)
-    ):
-        raise CallError("INVALID_SUBMIT", "Invalid evidence reference list")
-    seen = start["first_seen_step"]
-    valid = [x for x in dict.fromkeys(refs) if x in seen]
-    return {**args, "evidence_ids": valid}, [x for x in refs if x not in seen]
+    prediction = args.get("prediction")
+    if prediction not in [x["class_id"] for x in classes]:
+        raise CallError("INVALID_SUBMIT", "Submit requires a valid category ID")
+    refs = args.get("evidence_ids", [])
+    if not isinstance(refs, list):
+        refs = [refs]
+        valid, invalid = [], refs
+    else:
+        seen = start["first_seen_step"]
+        valid, invalid = [], []
+        for node in refs:
+            if isinstance(node, str) and node in seen and node not in valid and len(valid) < 20:
+                valid.append(node)
+            else:
+                invalid.append(node)
+    return {"prediction": prediction, "evidence_ids": valid}, invalid
 
 
 def target_similarity(data, state, level, node):
@@ -857,9 +878,74 @@ def compact_tool_result(result):
     return output
 
 
+def text_fields(header, fields):
+    return " | ".join([header] + [
+        f"{key}={str(value).lower() if isinstance(value, bool) else value}"
+        for key, value in fields.items() if value is not None
+    ])
+
+
+def evidence_text(text, *, summary=False):
+    if summary and not text.startswith("Summary:"):
+        text = "Summary: " + text
+    # Escape only lines that could be mistaken for a section or a source header.
+    return re.sub(
+        r"(?m)^(?=\\|(?:Neighbors|Members|Evidence|Budget|Errors?|Status|Accepted)\s*:|Submit only\b|"
+        r"(?:Target |Community )?[FC]:[0-9]+\b)",
+        r"\\",
+        text,
+    )
+
+
+def render_tool_result(result):
+    compact = compact_tool_result(result)
+    blocks = []
+    for key, title in (("neighbors", "Neighbors"), ("members", "Members")):
+        if key not in compact:
+            continue
+        lines = [f"{title}:"]
+        for source, entry in compact[key].items():
+            weights = entry.get("weights", {})
+            nodes = ", ".join(f"{node}(w={weights[node]})" if node in weights else node for node in entry["nodes"])
+            parts = [text_fields(f"{source} -> {nodes or 'none'}", {"remaining": entry.get("remaining")})]
+            if "status" in entry:
+                status = "partial: context limited" if entry["status"] == "partial" else entry["status"]
+                parts.append(status + (f": {entry['message']}" if entry.get("message") else ""))
+            lines.append(" | ".join(parts))
+        blocks.append("\n".join(lines))
+    if compact.get("errors"):
+        lines = ["Errors:"]
+        for error in compact["errors"]:
+            source = " ".join(error.get("ref", "").split())
+            message = f": {error['message']}" if error.get("message") else ""
+            lines.append(f"query {error['index']} {source}".rstrip() + f" | {error['status']}{message}")
+        blocks.append("\n".join(lines))
+    if (err := compact.get("error")) is not None:
+        blocks.append(f"Error: {err['code']}: {err['message']}")
+    if compact.get("evidence"):
+        evidence_blocks = []
+        for node, item in compact["evidence"].items():
+            fields = {"sim": f"{item['sim']:.3f}", **{
+                k: v for k, v in item.items() if k not in ("sim", "text")
+            }}
+            evidence_blocks.append(text_fields(node, fields) + "\n" + evidence_text(
+                item["text"], summary=node.startswith("C:"),
+            ))
+        blocks.append("Evidence:\n" + "\n\n".join(evidence_blocks))
+    if "budget" in compact:
+        blocks.append(f"Budget: {compact['budget']}")
+    if compact.get("submit_only"):
+        blocks.append("Submit only")
+    if compact.get("status"):
+        blocks.append(f"Status: {compact['status']}")
+    if compact.get("accepted"):
+        blocks.append("Accepted")
+    return "\n\n".join(blocks) if blocks else "OK"
+
+
 def tool_messages(calls, results):
     return [
-        {"role": "tool", "tool_call_id": call["id"], "content": dumps(compact_tool_result(result))}
+        {"role": "tool", "tool_call_id": call["id"], "content": render_tool_result(result)}
         for call, result in zip(calls, results)
     ]
 
@@ -1058,7 +1144,7 @@ def verify_tool_capability(store, c, classes, tools, counter):
     from experiment_io import verify_deployment
 
     identity = verify_deployment(store, c, "AGENT")
-    capability_hash = digest([identity, counter.identity, "batched-tool-probe-v2"])
+    capability_hash = digest([identity, counter.identity, "batched-tool-probe-v3"])
     if store.meta("capability_verified") == capability_hash:
         return
     owner = "capability:agent:" + capability_hash[:16]
@@ -1073,7 +1159,7 @@ def verify_tool_capability(store, c, classes, tools, counter):
             "expand_community", expansions,
             f"只调用一次 expand_community，参数为 {dumps({'queries': expansions})}。",
         ),
-        ("submit", None, f"只调用 submit，prediction={class_id}，evidence_ids=[]，reason 写接口检查。"),
+        ("submit", None, f"只调用 submit，prediction={class_id}。"),
     ]
     messages = [{"role": "system", "content": "验证原生工具协议。根据当前用户指令调用函数。"}]
     call_ids = set()
@@ -1184,11 +1270,14 @@ def handle_round(store, key, task, data, c, classes, tools, counter):
         mapping = normalize_calls(calls, {**start, "messages": messages})
         submits = [call for call in calls if call["name"] == "submit"]
         selected = None
+        ignored_submit_fields = []
         for call in submits:
             try:
-                args, invalid_refs = validate_submit(arguments(call), start, classes)
+                submitted_args = arguments(call)
+                args, invalid_refs = validate_submit(submitted_args, start, classes)
             except CallError:
                 continue
+            ignored_submit_fields = ["reason"] if "reason" in submitted_args else []
             selected = call
             break
         if selected:
@@ -1208,12 +1297,12 @@ def handle_round(store, key, task, data, c, classes, tools, counter):
                 trigger = "graph_budget"
             else:
                 trigger = "no_available_query"
-            task.update(status="submitted", **args, submit_trigger=trigger,
+            task.update(status="submitted", **args, reason=None, submit_trigger=trigger,
                         submit_after_failed_tool_round=start.get("last_event_status") == "tool_failed")
             event_status = "submitted"
         else:
             if submits:
-                raise CallError("INVALID_SUBMIT", "Submit requires a valid category, reason and reference list")
+                raise CallError("INVALID_SUBMIT", "Submit requires a valid category ID")
             if forced:
                 raise CallError("FINAL_ROUND_REQUIRES_SUBMIT", "Expected a submit call")
             state, results = pack_tool_batch(data, start, message, calls, c, counter, messages)
@@ -1269,6 +1358,7 @@ def handle_round(store, key, task, data, c, classes, tools, counter):
             "step_id": step, "generation_index": generation, "accepted_attempt_id": aid,
             "event_status": event_status, "calls": calls, "results": results,
             "id_mapping": mapping, "invalid_evidence_ids": invalid_refs,
+            "ignored_submit_fields": ignored_submit_fields,
             "new_evidence_count": sum(len(r.get("new_evidence", [])) for r in results),
             "remaining_before": remaining(start, c), "remaining_after": remaining(state, c),
             "submit_trigger": task.get("submit_trigger"),
@@ -1415,7 +1505,17 @@ def run(c):
             raise ValueError(
                 "Legacy experiment has requests without a pinned prompt identity; use a new experiment ID"
             )
-        store.pin("prompt_schema", digest({"system": SYSTEM, "tools": tools, "submit": FORCE_SUBMIT}))
+        prompts = {m: system_prompt(classes, m) for m in sorted(MODES)}
+        store.pin("prompt_schema", digest({"system": prompts, "tools": tools, "submit": FORCE_SUBMIT}))
+        if store.meta("source_commit") is None:
+            try:
+                revision = subprocess.run(
+                    ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+                    capture_output=True, check=True, text=True, timeout=2,
+                ).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                revision = "unavailable"
+            store.pin("source_commit", revision)
         counter = TokenCounter(c, tools)
         store.pin("tokenizer_template", counter.identity)
         modes = csv_values(c, "AGENT_MODES")
@@ -1458,6 +1558,9 @@ def run(c):
                 "schema_version": VERSION,
                 "experiment_id": c["EXPERIMENT_ID"],
                 "algorithm": AGENT_ALGORITHM,
+                "git_commit_sha": store.meta("source_commit"),
+                "tool_schema_sha256": digest(tools),
+                "system_prompt_sha256_by_mode": {m: digest(text) for m, text in prompts.items()},
                 "config_hash": store.meta("config"),
                 "graph_manifest_sha256": data["manifest_hash"],
                 "evaluation_input_sha256": digest(fixed),

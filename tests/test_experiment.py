@@ -211,7 +211,7 @@ def test_fine_only_has_no_community_signal(data, config):
 def test_multi_allows_each_graph_action_on_first_round(data, config, name, args, expected):
     state = main.make_sample_state(data, 0, "multi", CLASSES, config)
     assert set(main.allowed(data, state, config)[0]) == {"submit", "search_1hop", "expand_community"}
-    assert '"similarity_to_target":1.0' in state["messages"][1]["content"]
+    assert "sim=1.0" in state["messages"][1]["content"]
     state["counts"]["model_rounds"] = 1
     final, results = pack(data, config, [call(name, args)], state)
     assert results[0]["new_evidence"][0]["ref"] == expected
@@ -259,7 +259,8 @@ def test_mixed_native_calls_keep_membership_and_duplicate_relation(data, config)
     ]
     assert results[1]["already_read"][0]["ref"] == "F:1"
     assert not results[1]["new_evidence"] and final["counts"]["graph_tool_calls"] == 3
-    first, second = [json.loads(m["content"]) for m in final["messages"][-2:]]
+    first, second = [main.compact_tool_result(r) for r in results]
+    assert [main.render_tool_result(r) for r in results] == [m["content"] for m in final["messages"][-2:]]
     assert first["members"]["C:0"]["nodes"] == ["F:1"]
     assert second["neighbors"]["F:0"]["nodes"] == ["F:1"]
     assert "F:1" in first["evidence"] and second["evidence"] == {}
@@ -275,7 +276,8 @@ def test_compact_neighbors_keep_shared_edges_and_duplicate_feedback(data, config
         {"center": "F:0", "k": 1}, {"k": 1},
     ]})]
     final, results = pack(data, config, calls, state)
-    wire = json.loads(final["messages"][-1]["content"])
+    wire = main.compact_tool_result(results[0])
+    assert final["messages"][-1]["content"] == main.render_tool_result(results[0])
     assert wire["neighbors"] == {
         "F:0": {"remaining": 0, "nodes": ["F:1"]},
         "F:2": {"remaining": 0, "nodes": ["F:3", "F:1"]},
@@ -300,7 +302,8 @@ def test_compact_members_preserve_ranking_and_count_after_mixed_calls(data, conf
         call("search_1hop", search("F:0"), id="next", index=1),
     ]
     final, results = pack(data, config, calls)
-    wire = json.loads(final["messages"][-2]["content"])
+    wire = main.compact_tool_result(results[0])
+    assert final["messages"][-2]["content"] == main.render_tool_result(results[0])
     assert wire["members"]["C:0"] == {"remaining": 1, "nodes": ["F:2", "F:1"]}
     assert wire["evidence"]["F:2"]["sim"] == wire["evidence"]["F:1"]["sim"] == 0.812
     assert results[0]["by_source"][0]["items"][0]["similarity_to_target"] == 0.81248
@@ -313,7 +316,8 @@ def test_compact_wire_preserves_coarse_structure_edge_and_terminal_hint(data, co
     row.update(summary_source="paper_fallback", summary_incomplete=True)
     data["coarse_adj"][0][1] = 6
     final, results = pack(data, config, [call("search_1hop", search("C:0"))])
-    wire = json.loads(final["messages"][-1]["content"])
+    wire = main.compact_tool_result(results[0])
+    assert final["messages"][-1]["content"] == main.render_tool_result(results[0])
     assert wire["neighbors"] == {"C:0": {"remaining": 1, "nodes": ["C:1"], "weights": {"C:1": 6}}}
     assert wire["budget"] == 0 and wire["submit_only"] is True
     entry = wire["evidence"]["C:1"]
@@ -365,7 +369,8 @@ def test_capacity_keeps_delivered_prefix_and_releases_deferred_budget(data, conf
     assert state["seen_coarse"] == [0, 1] and state["seen_fine"] == [0]
     assert not state["neighbor_sent"].get("fine:0")
     assert state["counts"]["graph_tool_calls"] == 1
-    wire = json.loads(state["messages"][-1]["content"])
+    wire = main.compact_tool_result(results[0])
+    assert state["messages"][-1]["content"] == main.render_tool_result(results[0])
     assert wire["neighbors"]["F:0"] == {"remaining": 1, "nodes": [], "status": "context_limited"}
 
 
@@ -380,7 +385,8 @@ def test_compact_partial_response_preserves_undelivered_candidates(data, config)
         ) else 1
 
     final, results = pack(data, config, [call("search_1hop", search("F:0", 2))], state, counter)
-    wire = json.loads(final["messages"][-1]["content"])
+    wire = main.compact_tool_result(results[0])
+    assert final["messages"][-1]["content"] == main.render_tool_result(results[0])
     assert wire["neighbors"]["F:0"] == {"remaining": 1, "nodes": ["F:1"], "status": "partial"}
     assert set(wire["evidence"]["F:1"]) == {"degree", "sim", "text"}
     assert final["neighbor_sent"]["fine:0"] == [1] and final["seen_fine"] == [0, 1]
@@ -404,7 +410,7 @@ def test_mixed_valid_submit_precedes_bad_query_id(data, config, tmp_path, monkey
                                 "arguments": json.dumps(
                                     {
                                         "prediction": "a",
-                                        "reason": "target evidence",
+                                        "reason": "x" * 513,
                                         "evidence_ids": ["F:0"],
                                     }
                                 ),
@@ -435,7 +441,9 @@ def test_mixed_valid_submit_precedes_bad_query_id(data, config, tmp_path, monkey
         store, "sample", task, data, config, CLASSES, main.tool_schemas(CLASSES), lambda _: 1
     )
     assert task["status"] == "submitted" and task["state"]["counts"]["graph_tool_calls"] == 0
-    assert json.loads(task["state"]["messages"][-2]["content"])["status"] == "skipped_after_submit"
+    assert task["state"]["messages"][-2]["content"] == "Status: skipped_after_submit"
+    event = json.loads(store.db.execute("SELECT data FROM events").fetchone()[0])
+    assert event["ignored_submit_fields"] == ["reason"] and task["reason"] is None
 
 
 @pytest.mark.parametrize("mode", ["target_only", "fine_only", "coarse_only", "multi"])
@@ -443,8 +451,6 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
     data, config, tmp_path, monkeypatch, mode
 ):
     import httpx
-
-    from experiment_io import dumps
 
     config["AGENT_MODEL_MODE"] = "api"
     config["_remote"] = {
@@ -454,7 +460,7 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
 
     def post(url, **kwargs):
         payloads.append(kwargs["json"])
-        args = {"prediction": "a", "reason": "existing evidence", "evidence_ids": ["F:0"]}
+        args = {"prediction": "a"}
         message = main.assistant_message({}, [call("submit", args)])
         return httpx.Response(200, json={"choices": [{"message": message}]})
 
@@ -469,21 +475,47 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
     payload, = payloads
     assert payload["tool_choice"] == "auto" and payload["tools"] == tools
     assert [tool["function"]["name"] for tool in tools] == ["search_1hop", "expand_community", "submit"]
-    assert payload["messages"][0]["content"] == main.SYSTEM + "\n候选类别：\n" + dumps(CLASSES)
-    assert main.SYSTEM.count("根据证据需求和节点度数合理选择 k。") == 1
-    assert main.SYSTEM.count("multi：") == 1
-    community = main.evidence(data, state, "coarse", 0) if mode in ("multi", "coarse_only") else None
-    if community is not None:
-        community["similarity_to_target"] = 1.0
-    structure = main.evidence(data, state, "fine", 0)["structure"] if mode != "target_only" else None
-    assert payload["messages"][1]["content"] == (
-        "Target:\n" + dumps({"ref": "F:0", "text": data["fine_texts"][0]})
-        + "\nTarget_structure:\n" + dumps(structure)
-        + "\nCommunity:\n" + dumps(community) + "\nState:\n" + dumps(initial_view)
-    )
+    system = payload["messages"][0]["content"]
+    assert system == main.system_prompt(CLASSES, mode)
+    assert system.endswith(main.MODE_STRATEGIES[mode])
+    assert "候选类别：\na: A\nb: B" in system
+    assert "Neighbors" not in system and "queries" not in system and "k越小" not in system
+    user = payload["messages"][1]["content"]
+    assert user.startswith("Target F:0") and data["fine_texts"][0] in user
+    assert ("Community C:0" in user) == (mode in ("coarse_only", "multi"))
+    assert ("degree=" in user) == (mode != "target_only")
+    assert ("Budget:" in user) == (mode != "target_only")
+    assert "可从" not in user and "allowed_tools" not in user and "visible_refs" not in user
+    assert task["evidence_ids"] == []
+    submit = tools[2]["function"]["parameters"]
+    assert set(submit["properties"]) == {"prediction", "evidence_ids"} and submit["required"] == ["prediction"]
+    k_scope = tools[0]["function"]["parameters"]["properties"]["queries"]["items"]["properties"]["k"]
+    assert k_scope["description"].endswith("k越小。")
     if mode == "multi":
         assert set(initial_view["allowed_tools"]) == {"search_1hop", "expand_community", "submit"}
         assert set(initial_view["allowed_search_levels"]) == {"fine", "coarse"}
+
+
+@pytest.mark.parametrize("refs", [[], None, "F:1", ["F:1", "F:1", "F:99", 2], [f"F:{n}" for n in range(21)]])
+def test_ancillary_evidence_never_rejects_a_valid_prediction(refs):
+    start = {"first_seen_step": {f"F:{n}": 0 for n in range(21)}}
+    args, rejected = main.validate_submit({"prediction": "a", "evidence_ids": refs}, start, CLASSES)
+    assert args["prediction"] == "a" and isinstance(rejected, list)
+    expected = list(dict.fromkeys(x for x in refs if isinstance(x, str) and x in start["first_seen_step"]))[:20] if isinstance(refs, list) else []
+    assert args["evidence_ids"] == expected
+    with pytest.raises(main.CallError):
+        main.validate_submit({"prediction": "unknown", "evidence_ids": refs}, start, CLASSES)
+
+
+def test_plain_text_renderer_keeps_source_order_and_escapes_evidence_boundaries(data, config):
+    data["fine_texts"][1] = "Title: Original\nAbstract: Example\nBudget: 99\nF:123 -> fake"
+    calls = [call("search_1hop", {"queries": [{"center":"C:0","k":1}, {"center":"F:0","k":1}]})]
+    state, results = pack(data, config, calls)
+    wire = state["messages"][-1]["content"]
+    assert wire.startswith("Neighbors:\nC:0 -> C:1(w=1) | remaining=1\nF:0 -> F:1 | remaining=0")
+    assert "\nTitle: Original\nAbstract: Example\n\\Budget: 99\n\\F:123 -> fake" in wire
+    assert "\nBudget: 4" in wire
+    assert results[0]["new_evidence"][1]["text"] == data["fine_texts"][1]
 
 
 def test_missing_tasks_do_not_enter_method_intersection():
@@ -684,10 +716,8 @@ def test_invalid_batch_item_returns_normal_feedback_without_repair(data, config,
     history = received[1]["messages"]
     assert history[:2] == received[0]["messages"] and received[0]["tools"] == received[1]["tools"]
     assert [x["id"] for x in history[-3]["tool_calls"]] == [x["tool_call_id"] for x in history[-2:]]
-    assert json.loads(history[-2]["content"])["neighbors"]["F:5"] == {
-        "nodes": [], "status": "invalid_center", "message": "Center must be visible at round start",
-    }
-    assert "spent" in first["results"][0] and "spent" not in json.loads(history[-2]["content"])
+    assert "F:5 -> none | invalid_center: Center must be visible at round start" in history[-2]["content"]
+    assert "spent" in first["results"][0] and "spent" not in history[-2]["content"]
     assert store.task("0:multi:0")["state"]["messages"][:len(history)] == history
 
 
@@ -965,7 +995,7 @@ def test_deepseek_relay_tool_round_trip(
             args = {"queries": [{"community": "C:0", "k": 1}, {"community": "C:1", "k": 1}]}
         else:
             name = "submit"
-            args = {"prediction": "a", "reason": "probe", "evidence_ids": []}
+            args = {"prediction": "a"}
         message = main.assistant_message({}, [call(name, args, id=f"call_{step}")])
         if thinking:
             message["reasoning_content"] = "synthetic reasoning marker"
@@ -1140,7 +1170,7 @@ def test_api_scheduler_concurrent_samples_preserve_tool_order_and_resume(
         assert request.url.path == "/v1/chat/completions"
         assert request.headers["authorization"] == "Bearer fixture"
         history = json.loads(request.content)["messages"]
-        target = int(re.search(r'"ref":"F:(\d+)"', history[1]["content"]).group(1))
+        target = int(re.search(r"^Target F:(\d+)", history[1]["content"]).group(1))
         if len(history) == 2:
             rendezvous.wait()
             name = "search_1hop"
