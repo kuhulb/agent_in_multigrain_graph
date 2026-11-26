@@ -211,7 +211,7 @@ def test_fine_only_has_no_community_signal(data, config):
 def test_multi_allows_each_graph_action_on_first_round(data, config, name, args, expected):
     state = main.make_sample_state(data, 0, "multi", CLASSES, config)
     assert set(main.allowed(data, state, config)[0]) == {"submit", "search_1hop", "expand_community"}
-    assert "sim=1.0" in state["messages"][1]["content"]
+    assert "similarity_to_target=1.000" in state["messages"][1]["content"]
     state["counts"]["model_rounds"] = 1
     final, results = pack(data, config, [call(name, args)], state)
     assert results[0]["new_evidence"][0]["ref"] == expected
@@ -491,11 +491,15 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
         "邻居节点或超节点的主题不一定与目标节点的类别一致，结构信息和语义相似度不能直接作为分类依据。\n\n"
         "若当前证据充足，则直接提交预测结果；否则，针对尚不明确的类别寻找补充证据。避免获取无关或重复的信息。\n\n"
         f"候选类别：\na: A\nb: B\n\n{strategies[mode]}"
+        + (f"\n\n{main.STRUCTURE_GUIDES[mode]}" if mode != "target_only" else "")
     )
     user = payload["messages"][1]["content"]
-    assert user.startswith("Target F:0") and data["fine_texts"][0] in user
+    if mode == "target_only":
+        assert user == data["fine_texts"][0]
+    else:
+        assert user.startswith("Target F:0") and data["fine_texts"][0] in user
     assert ("Community C:0" in user) == (mode in ("coarse_only", "multi"))
-    assert ("degree=" in user) == (mode != "target_only")
+    assert ("node_degree=" in user) == (mode != "target_only")
     assert ("Budget:" in user) == (mode != "target_only")
     assert "可从" not in user and "allowed_tools" not in user and "visible_refs" not in user
     assert task["evidence_ids"] == []
@@ -524,7 +528,7 @@ def test_plain_text_renderer_keeps_source_order_and_escapes_evidence_boundaries(
     calls = [call("search_1hop", {"queries": [{"center":"C:0","k":1}, {"center":"F:0","k":1}]})]
     state, results = pack(data, config, calls)
     wire = state["messages"][-1]["content"]
-    assert wire.startswith("Neighbors:\nC:0 -> C:1(w=1) | remaining=1\nF:0 -> F:1 | remaining=0")
+    assert wire.startswith("Neighbors:\nC:0 -> C:1(coarse_edge_weight=1) | remaining=1\nF:0 -> F:1 | remaining=0")
     assert "\nTitle: Original\nAbstract: Example\n\\Budget: 99\n\\F:123 -> fake" in wire
     assert "\nBudget: 4" in wire
     assert results[0]["new_evidence"][1]["text"] == data["fine_texts"][1]

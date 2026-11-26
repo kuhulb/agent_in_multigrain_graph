@@ -57,16 +57,31 @@ MODE_STRATEGIES = {
     "coarse_only": "若当前证据不足，仅允许查询已见超节点（C）的邻居。禁止查询原始节点或展开超节点。",
     "target_only": "仅根据目标节点的文本属性进行分类，直接提交预测结果，不进行任何图查询。",
 }
+FINE_STRUCTURE_GUIDE = "对原始节点，node_degree 是它在原始图中的邻居数。"
+COARSE_STRUCTURE_GUIDE = (
+    "对超节点，node_degree 是它在粗图中的邻居数，community_member_count 是它包含的原始节点数，"
+    "internal_edge_density 是社区内部实际边数占可能边数的比例，external_degree_fraction 是社区成员总度数中连向社区外的比例。"
+    "coarse_edge_weight 是连接两个社区的原始边数。"
+)
+SIMILARITY_GUIDE = "similarity_to_target 是节点文本向量与目标节点文本向量的余弦相似度。"
+MEMBERSHIP_GUIDE = "same_community_as_target 表示该原始节点与目标节点是否属于同一社区。"
+STRUCTURE_GUIDES = {
+    "fine_only": FINE_STRUCTURE_GUIDE + SIMILARITY_GUIDE,
+    "coarse_only": FINE_STRUCTURE_GUIDE + COARSE_STRUCTURE_GUIDE + SIMILARITY_GUIDE + MEMBERSHIP_GUIDE,
+    "multi": FINE_STRUCTURE_GUIDE + COARSE_STRUCTURE_GUIDE + SIMILARITY_GUIDE + MEMBERSHIP_GUIDE,
+}
 
 
 def system_prompt(classes, mode):
     labels = "\n".join(f"{row['class_id']}: {row['name']}" for row in classes)
+    guide = STRUCTURE_GUIDES.get(mode)
     return (
         "你的任务是判断目标节点所属的类别。\n\n"
         "以目标节点自身的文本属性为主要分类依据，其他节点的信息仅用于辅助判断。"
         "邻居节点或超节点的主题不一定与目标节点的类别一致，结构信息和语义相似度不能直接作为分类依据。\n\n"
         "若当前证据充足，则直接提交预测结果；否则，针对尚不明确的类别寻找补充证据。避免获取无关或重复的信息。\n\n"
         f"候选类别：\n{labels}\n\n{MODE_STRATEGIES[mode]}"
+        + (f"\n\n{guide}" if guide else "")
     )
 
 
@@ -112,8 +127,8 @@ def tool_schemas(classes, c=None):
         (
             "search_1hop",
             "批量查询已见节点的1-hop邻居。F:表示原始节点，C:表示超节点。优先返回未见节点，再按与目标节点的相似度排序。"
-            "Neighbors记录邻接关系，w为粗图边权，remaining为剩余候选数，Evidence为新增证据，"
-            "sim为与目标节点的相似度，degree为所在图的邻居数，Budget为剩余查询预算。",
+            "Neighbors记录邻接关系，coarse_edge_weight为粗图边权，remaining为剩余候选数，Evidence为新增证据，"
+            "similarity_to_target为与目标节点的相似度，node_degree为所在图的邻居数，Budget为剩余查询预算。",
             batch(
                 "center", "本轮开始前已见的原始节点或超节点ID；同一来源同类操作每轮仅查一次，后续轮可续取。",
                 "最多返回的邻居数。根据证据需求和节点度数选择。在同一张图上，通常距搜索起点越远，k越小。",
@@ -123,7 +138,7 @@ def tool_schemas(classes, c=None):
             "expand_community",
             "批量获取已见超节点包含的未见原始节点，按与目标节点的相似度降序返回。"
             "Members记录成员关系，remaining为剩余候选数，Evidence为新增证据，"
-            "sim为与目标节点的相似度，degree为原始图的邻居数，Budget为剩余查询预算。",
+            "similarity_to_target为与目标节点的相似度，node_degree为原始图的邻居数，Budget为剩余查询预算。",
             batch(
                 "community", "本轮开始前已见的超节点ID；同一来源同类操作每轮仅查一次，后续轮可续取。",
                 "最多返回的原始节点数，根据证据需求和超节点大小合理选择。",
@@ -528,9 +543,10 @@ def make_sample_state(data, target, mode, classes, c, counter=None):
         evidence(data, s, "fine", target)["structure"] if mode != "target_only" else None
     )
     community = evidence(data, s, "coarse", home) if home is not None else None
-    if home is not None:
+    if community is not None:
         s["first_seen_step"][ref("coarse", home)] = 0
-        community["similarity_to_target"] = round(target_similarity(data, s, "coarse", home), 4)
+        community_similarity = target_similarity(data, s, "coarse", home)
+        community["similarity_to_target"] = round(community_similarity, 4)
     s["initial_evidence"] = {
         "target": {**target_part, "structure": target_structure}, "community": community,
     }
@@ -539,25 +555,21 @@ def make_sample_state(data, target, mode, classes, c, counter=None):
     )
     header = f"Target {target_part['ref']}"
     if target_structure:
-        header = text_fields(header, {
-            "degree": target_structure["degree"],
-            "same_community": target_structure.get("same_community_as_target"),
-        })
+        header = text_fields(header, model_evidence_fields(target_structure, coarse=False))
     blocks = [header + "\n" + evidence_text(target_part["text"])]
-    if community:
+    if community is not None:
         attrs = community["structure"]
-        blocks.append(text_fields(f"Community {community['ref']}", {
-            "degree": attrs["degree"], "size": attrs["size"], "density": attrs["density"],
-            "ext_deg_frac": attrs["ext_deg_frac"], "sim": community["similarity_to_target"],
-            "summary_incomplete": True if attrs.get("summary_incomplete") else None,
-        }) + "\n" + evidence_text(community["text"], summary=True))
+        fields = model_evidence_fields(attrs, coarse=True)
+        fields["similarity_to_target"] = community_similarity
+        blocks.append(text_fields(f"Community {community['ref']}", fields)
+                      + "\n" + evidence_text(community["text"], summary=True))
     if mode != "target_only":
         blocks.append(f"Budget: {remaining(s, c)['graph_tool_calls']}")
         if allowed(data, s, c)[0] == ["submit"]:
             blocks.append("Submit only")
     s["messages"] = [
         {"role": "system", "content": system_prompt(classes, mode)},
-        {"role": "user", "content": "\n\n".join(blocks)},
+        {"role": "user", "content": target_part["text"] if mode == "target_only" else "\n\n".join(blocks)},
     ]
     if counter is not None:
         s["context_tokens_available"] = context_input_limit(c) - counter(s["messages"])
@@ -809,7 +821,7 @@ def assistant_message(raw_message, calls):
     return message
 
 
-def compact_tool_result(result):
+def compact_tool_result(result, mode=None):
     """Project an execution result onto the fields the model can use."""
     if "by_source" not in result:
         return result
@@ -830,12 +842,17 @@ def compact_tool_result(result):
         for index, row in enumerate(rows):
             source = row["source"]
             status = row["status"]
+            hide_source = mode == "fine_only" and (
+                group_key == "members"
+                or not isinstance(source, str)
+                or not re.fullmatch(r"F:(0|[1-9][0-9]*)", source)
+            )
             if (
-                not isinstance(source, str) or not re.fullmatch(r"[FC]:(0|[1-9][0-9]*)", source)
+                hide_source or not isinstance(source, str) or not re.fullmatch(r"[FC]:(0|[1-9][0-9]*)", source)
                 or source in groups or (source in resolved and row["total_count"] is None)
             ):
                 error = {"index": index, "status": status}
-                if source is not None:
+                if source is not None and not hide_source:
                     error["ref"] = source
                 if row.get("message"):
                     error["message"] = row["message"]
@@ -885,9 +902,31 @@ def compact_tool_result(result):
     return output
 
 
+def model_evidence_fields(structure, *, coarse):
+    fields = {"node_degree": structure.get("degree")}
+    if coarse:
+        fields.update(
+            community_member_count=structure.get("size"),
+            internal_edge_density=structure.get("density"),
+            external_degree_fraction=structure.get("ext_deg_frac"),
+            summary_incomplete=structure.get("summary_incomplete") or None,
+        )
+    else:
+        fields["same_community_as_target"] = structure.get("same_community_as_target")
+    return fields
+
+
+def field_value(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    return str(value)
+
+
 def text_fields(header, fields):
     return " | ".join([header] + [
-        f"{key}={str(value).lower() if isinstance(value, bool) else value}"
+        f"{key}={field_value(value)}"
         for key, value in fields.items() if value is not None
     ])
 
@@ -904,8 +943,10 @@ def evidence_text(text, *, summary=False):
     )
 
 
-def render_tool_result(result):
-    compact = compact_tool_result(result)
+def render_tool_result(result, mode=None):
+    if mode == "target_only" and "by_source" in result and not result.get("status"):
+        return "Status: mode_forbidden"
+    compact = compact_tool_result(result, mode)
     blocks = []
     for key, title in (("neighbors", "Neighbors"), ("members", "Members")):
         if key not in compact:
@@ -913,13 +954,18 @@ def render_tool_result(result):
         lines = [f"{title}:"]
         for source, entry in compact[key].items():
             weights = entry.get("weights", {})
-            nodes = ", ".join(f"{node}(w={weights[node]})" if node in weights else node for node in entry["nodes"])
+            nodes = ", ".join(
+                f"{node}(coarse_edge_weight={field_value(weights[node])})"
+                if node in weights and mode != "fine_only" else node
+                for node in entry["nodes"] if mode != "fine_only" or node.startswith("F:")
+            )
             parts = [text_fields(f"{source} -> {nodes or 'none'}", {"remaining": entry.get("remaining")})]
             if "status" in entry:
                 status = "partial: context limited" if entry["status"] == "partial" else entry["status"]
                 parts.append(status + (f": {entry['message']}" if entry.get("message") else ""))
             lines.append(" | ".join(parts))
-        blocks.append("\n".join(lines))
+        if len(lines) > 1 or mode != "fine_only":
+            blocks.append("\n".join(lines))
     if compact.get("errors"):
         lines = ["Errors:"]
         for error in compact["errors"]:
@@ -932,13 +978,19 @@ def render_tool_result(result):
     if compact.get("evidence"):
         evidence_blocks = []
         for node, item in compact["evidence"].items():
-            fields = {"sim": f"{item['sim']:.3f}", **{
-                k: v for k, v in item.items() if k not in ("sim", "text")
-            }}
+            coarse = node.startswith("C:")
+            if mode == "fine_only" and coarse:
+                continue
+            fields = {"similarity_to_target": item["sim"], **model_evidence_fields(item, coarse=coarse)}
+            if coarse:
+                fields["summary_source"] = item.get("summary_source")
+            elif mode != "fine_only":
+                fields["same_community_as_target"] = item.get("same_community")
             evidence_blocks.append(text_fields(node, fields) + "\n" + evidence_text(
-                item["text"], summary=node.startswith("C:"),
+                item["text"], summary=coarse,
             ))
-        blocks.append("Evidence:\n" + "\n\n".join(evidence_blocks))
+        if evidence_blocks:
+            blocks.append("Evidence:\n" + "\n\n".join(evidence_blocks))
     if "budget" in compact:
         blocks.append(f"Budget: {compact['budget']}")
     if compact.get("submit_only"):
@@ -950,9 +1002,9 @@ def render_tool_result(result):
     return "\n\n".join(blocks) if blocks else "OK"
 
 
-def tool_messages(calls, results):
+def tool_messages(calls, results, mode=None):
     return [
-        {"role": "tool", "tool_call_id": call["id"], "content": render_tool_result(result)}
+        {"role": "tool", "tool_call_id": call["id"], "content": render_tool_result(result, mode)}
         for call, result in zip(calls, results)
     ]
 
@@ -1043,7 +1095,7 @@ def pack_tool_batch(data, start, assistant, calls, c, counter, messages=None):
 
         new_refs = sorted(state["first_seen_step"].keys() - start["first_seen_step"].keys())
         results[-1]["state_delta"] = state_view(data, state, c, new_refs)
-        history = messages + [msg] + tool_messages(calls, results)
+        history = messages + [msg] + tool_messages(calls, results, start["mode"])
         room = limit - counter(history + [terminal])
         if room >= 0:
             state["context_tokens_available"] = room
@@ -1060,7 +1112,7 @@ def pack_tool_batch(data, start, assistant, calls, c, counter, messages=None):
             minimal[key[0]]["new_evidence"] = new
             minimal[key[0]]["by_source"] = [last]
             minimal[key[0]]["budget"] = budget
-            if counter(messages + [msg] + tool_messages(calls, minimal) + [terminal]) > limit:
+            if counter(messages + [msg] + tool_messages(calls, minimal, start["mode"]) + [terminal]) > limit:
                 omitted.setdefault(key, set()).add(new[0]["ref"])
                 continue
         caps[key] = count - 1
@@ -1290,7 +1342,9 @@ def handle_round(store, key, task, data, c, classes, tools, counter):
         if selected:
             state = copy.deepcopy(start)
             results = skipped_results(calls, state, "skipped_after_submit", selected)
-            state["messages"] = messages + [assistant_message(message, calls)] + tool_messages(calls, results)
+            state["messages"] = messages + [assistant_message(message, calls)] + tool_messages(
+                calls, results, start["mode"]
+            )
             rem = remaining(start, c)
             if not forced:
                 trigger = "model"
@@ -1374,7 +1428,7 @@ def handle_round(store, key, task, data, c, classes, tools, counter):
         suffix, skipped = [], []
         if calls:
             skipped = skipped_results(calls, start, "skipped_during_protocol_repair")
-            suffix = [assistant_message(message, calls)] + tool_messages(calls, skipped)
+            suffix = [assistant_message(message, calls)] + tool_messages(calls, skipped, start["mode"])
         elif isinstance(message, dict) and isinstance(message.get("content"), str) and message["content"].strip():
             assistant = {"role": "assistant", "content": message["content"]}
             if isinstance(message.get("reasoning_content"), str):
