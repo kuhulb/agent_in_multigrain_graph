@@ -233,12 +233,12 @@ def test_mixed_queries_validate_individually_and_can_page_next_round(data, confi
     assert state["counts"]["graph_tool_calls"] == 2
     state["counts"]["model_rounds"] += 1
     next_call = call("search_1hop", {"queries": [
-        {"center": "C:0", "k": 1}, {"center": "F:1", "k": 1},
+        {"center": "C:0", "k": 1}, {"center": "F:1", "k": 10},
     ]}, id="next")
     _, results = pack(data, config, [next_call], state)
-    assert [r["ref"] for r in results[0]["new_evidence"]] == ["C:2", "F:2"]
-    assert len(results[0]["by_source"][1]["items"]) == 1
-    assert not results[0]["already_read"]
+    assert [r["ref"] for r in results[0]["new_evidence"]] == ["C:2", "F:2", "F:4"]
+    assert [r["ref"] for r in results[0]["by_source"][1]["items"]] == ["F:2", "F:4", "F:0"]
+    assert [r["ref"] for r in results[0]["already_read"]] == ["F:0"]
 
 
 def test_mixed_native_calls_keep_membership_and_duplicate_relation(data, config):
@@ -436,6 +436,54 @@ def test_mixed_valid_submit_precedes_bad_query_id(data, config, tmp_path, monkey
     )
     assert task["status"] == "submitted" and task["state"]["counts"]["graph_tool_calls"] == 0
     assert json.loads(task["state"]["messages"][-2]["content"])["status"] == "skipped_after_submit"
+
+
+@pytest.mark.parametrize("mode", ["target_only", "fine_only", "coarse_only", "multi"])
+def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
+    data, config, tmp_path, monkeypatch, mode
+):
+    import httpx
+
+    from experiment_io import dumps
+
+    config["AGENT_MODEL_MODE"] = "api"
+    config["_remote"] = {
+        "stage": "AGENT", "base_url": "https://fixture.invalid/v1", "key": "fixture",
+    }
+    payloads = []
+
+    def post(url, **kwargs):
+        payloads.append(kwargs["json"])
+        args = {"prediction": "a", "reason": "existing evidence", "evidence_ids": ["F:0"]}
+        message = main.assistant_message({}, [call("submit", args)])
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    monkeypatch.setattr(httpx, "post", post)
+    tools = main.tool_schemas(CLASSES, config)
+    state = main.make_sample_state(data, 0, mode, CLASSES, config)
+    initial_view = main.state_view(data, state, config)
+    task = {"status": "running", "mode": mode, "repeat_id": 0, "target_id": 0, "state": state}
+    store = Store(tmp_path / "experiment.sqlite")
+    main.handle_round(store, f"0:{mode}:0", task, data, config, CLASSES, tools, lambda _: 1)
+    assert task["status"] == "submitted" and task["state"]["counts"]["graph_tool_calls"] == 0
+    payload, = payloads
+    assert payload["tool_choice"] == "auto" and payload["tools"] == tools
+    assert [tool["function"]["name"] for tool in tools] == ["search_1hop", "expand_community", "submit"]
+    assert payload["messages"][0]["content"] == main.SYSTEM + "\n候选类别：\n" + dumps(CLASSES)
+    assert main.SYSTEM.count("根据证据需求和节点度数合理选择 k。") == 1
+    assert main.SYSTEM.count("multi：") == 1
+    community = main.evidence(data, state, "coarse", 0) if mode in ("multi", "coarse_only") else None
+    if community is not None:
+        community["similarity_to_target"] = 1.0
+    structure = main.evidence(data, state, "fine", 0)["structure"] if mode != "target_only" else None
+    assert payload["messages"][1]["content"] == (
+        "Target:\n" + dumps({"ref": "F:0", "text": data["fine_texts"][0]})
+        + "\nTarget_structure:\n" + dumps(structure)
+        + "\nCommunity:\n" + dumps(community) + "\nState:\n" + dumps(initial_view)
+    )
+    if mode == "multi":
+        assert set(initial_view["allowed_tools"]) == {"search_1hop", "expand_community", "submit"}
+        assert set(initial_view["allowed_search_levels"]) == {"fine", "coarse"}
 
 
 def test_missing_tasks_do_not_enter_method_intersection():
