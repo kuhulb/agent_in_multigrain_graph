@@ -35,7 +35,7 @@ STATUSES = {
     "submitted",
 }
 METHOD_TERMINAL = {"submitted", "protocol_failure"}
-EVAL_VERSION = 5
+EVAL_VERSION = 6
 
 
 def token_summary(usages):
@@ -60,6 +60,10 @@ def token_summary(usages):
         "rejected_total_tokens_known_requests",
         "finish_reason_known_requests",
         "finish_length_requests",
+        "content_observed_requests",
+        "content_nonempty_requests",
+        "content_chars",
+        "content_tokens_known_requests",
         "cache_pair_input_tokens",
         "cache_pair_cached_tokens",
         "cache_known_requests",
@@ -74,6 +78,7 @@ def token_summary(usages):
         u["known_rejected_total_tokens"] for u in usages
         if u.get("known_rejected_total_tokens") is not None and u.get("rejected_attempts")
     ]
+    content_token_counts = [u["known_content_tokens"] for u in usages if u.get("known_content_tokens") is not None]
     totals.update(
         request_attempts=attempts,
         input_usage_complete_n=totals["input_tokens_complete_n"],
@@ -83,6 +88,9 @@ def token_summary(usages):
             (u["max_output_tokens"] for u in usages if u.get("max_output_tokens") is not None),
             default=None,
         ),
+        content_nonempty_ratio=totals["content_nonempty_requests"] / totals["content_observed_requests"]
+        if totals["content_observed_requests"] else None,
+        known_content_tokens=sum(content_token_counts) if content_token_counts else None,
         cache_pair_uncached_tokens=paired_input - paired_cache,
         cache_coverage=cache_known / attempts if attempts else None,
         cache_token_ratio=paired_cache / paired_input if paired_input else None,

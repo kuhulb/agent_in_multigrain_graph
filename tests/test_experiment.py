@@ -473,7 +473,7 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
     main.handle_round(store, f"0:{mode}:0", task, data, config, CLASSES, tools, lambda _: 1)
     assert task["status"] == "submitted" and task["state"]["counts"]["graph_tool_calls"] == 0
     payload, = payloads
-    assert payload["tool_choice"] == "auto" and payload["tools"] == tools
+    assert payload["tool_choice"] == "required" and payload["tools"] == tools
     assert [tool["function"]["name"] for tool in tools] == ["search_1hop", "expand_community", "submit"]
     system = payload["messages"][0]["content"]
     strategies = {
@@ -490,6 +490,7 @@ def test_initial_api_payload_keeps_evidence_and_allows_direct_submit(
         "以目标节点自身的文本属性为主要分类依据，其他节点的信息仅用于辅助判断。"
         "邻居节点或超节点的主题不一定与目标节点的类别一致，结构信息和语义相似度不能直接作为分类依据。\n\n"
         "若当前证据充足，则直接提交预测结果；否则，针对尚不明确的类别寻找补充证据。避免获取无关或重复的信息。\n\n"
+        "所有决策均通过工具调用完成，不输出分析过程、解释或其他普通文本。\n\n"
         f"候选类别：\na: A\nb: B\n\n{strategies[mode]}"
         + (f"\n\n{main.STRUCTURE_GUIDES[mode]}" if mode != "target_only" else "")
     )
@@ -677,7 +678,7 @@ def test_round_thirteen_can_query_and_fourteen_must_submit(
         assert task["status"] == "running" and task["active"]["generation"] == 1
         assert store.db.execute("SELECT data FROM failures").fetchone() is not None
         main.handle_round(store, "t", task, data, config, CLASSES, tools, lambda _: 1)
-        assert [p["tool_choice"] for p in payloads] == ["auto"] * 3
+        assert [p["tool_choice"] for p in payloads] == ["required"] * 3
         assert payloads[2]["messages"][:len(payloads[1]["messages"])] == payloads[1]["messages"]
         assert "按工具协议重新输出" in payloads[2]["messages"][-1]["content"]
     else:
@@ -966,19 +967,12 @@ def test_public_model_config_cannot_point_to_private_file(tmp_path):
         load_env(path)
 
 
-@pytest.mark.parametrize("thinking", [False, True])
-def test_deepseek_relay_tool_round_trip(
-    remote_config, tmp_path, monkeypatch, thinking
-):
+def test_deepseek_relay_tool_round_trip(remote_config, tmp_path, monkeypatch):
     import httpx
-    from experiment_io import configure_agent_low_thinking, load_env, stage_fingerprint
+    from experiment_io import load_env
 
     public, _ = remote_config
     config = load_env(public, model_stage="AGENT")
-    off_fingerprint = stage_fingerprint(config, "agent")
-    if thinking:
-        configure_agent_low_thinking(config)
-        assert stage_fingerprint(config, "agent") != off_fingerprint
     tool_schemas = main.tool_schemas(CLASSES, config)
     counter = main.TokenCounter(config, tool_schemas)
     store = Store(tmp_path / "probe.sqlite")
@@ -992,10 +986,10 @@ def test_deepseek_relay_tool_round_trip(
         payloads.append(payload)
         assert url.endswith("/chat/completions")
         assert "parallel_tool_calls" not in payload and "seed" not in payload
-        assert payload["thinking"]["type"] == ("enabled" if thinking else "disabled")
-        assert payload.get("reasoning_effort") == ("low" if thinking else None)
-        assert ("temperature" in payload) != thinking
-        assert payload["tool_choice"] == "auto"
+        assert payload["thinking"] == {"type": "disabled"}
+        assert "reasoning_effort" not in payload
+        assert payload["temperature"] == 0
+        assert payload["tool_choice"] == "required"
         step = len(payloads)
         if step > 1:
             history = payload["messages"]
@@ -1003,8 +997,7 @@ def test_deepseek_relay_tool_round_trip(
             assert [msg["role"] for msg in history[-3:]] == ["assistant", "tool", "user"]
             assert history[-2]["tool_call_id"] == f"call_{step - 1}"
             assert isinstance(history[-2]["content"], str)
-            if thinking:
-                assert history[-3]["reasoning_content"] == "synthetic reasoning marker"
+            assert history[-3]["content"] == "synthetic ordinary text"
             assert payload["tools"] == payloads[0]["tools"]
         if step == 1:
             name = "search_1hop"
@@ -1015,9 +1008,9 @@ def test_deepseek_relay_tool_round_trip(
         else:
             name = "submit"
             args = {"prediction": "a"}
-        message = main.assistant_message({}, [call(name, args, id=f"call_{step}")])
-        if thinking:
-            message["reasoning_content"] = "synthetic reasoning marker"
+        message = main.assistant_message(
+            {"content": "synthetic ordinary text"}, [call(name, args, id=f"call_{step}")]
+        )
         return httpx.Response(200, json={"choices": [{"message": message}]})
 
     monkeypatch.setattr(httpx, "get", reject_models_lookup)

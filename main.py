@@ -28,7 +28,6 @@ from experiment_io import (
     api_runtime,
     bounded_jobs,
     config_path,
-    configure_agent_low_thinking,
     csv_values,
     digest,
     dumps,
@@ -48,6 +47,8 @@ from experiment_io import (
 
 MODES = {"target_only", "fine_only", "coarse_only", "multi"}
 TARGET_SPLITS = ("train", "val", "test")
+AGENT_TOOL_CHOICE = "required"
+AGENT_THINKING = {"thinking": {"type": "disabled"}}
 MODE_STRATEGIES = {
     "multi": (
         "若当前证据不足，优先查询粗粒度图中的邻居。若粗粒度证据仍然不足，可展开超节点或查询原始图中的邻居，获取更具体的证据。\n\n"
@@ -80,6 +81,7 @@ def system_prompt(classes, mode):
         "以目标节点自身的文本属性为主要分类依据，其他节点的信息仅用于辅助判断。"
         "邻居节点或超节点的主题不一定与目标节点的类别一致，结构信息和语义相似度不能直接作为分类依据。\n\n"
         "若当前证据充足，则直接提交预测结果；否则，针对尚不明确的类别寻找补充证据。避免获取无关或重复的信息。\n\n"
+        "所有决策均通过工具调用完成，不输出分析过程、解释或其他普通文本。\n\n"
         f"候选类别：\n{labels}\n\n{MODE_STRATEGIES[mode]}"
         + (f"\n\n{guide}" if guide else "")
     )
@@ -1172,28 +1174,24 @@ class TokenCounter:
 
 def agent_payload(c, messages, tools, *, generation=0, seed=None, probe=False):
     remote = c.get("AGENT_MODEL_MODE", "local") == "api"
-    choice = c.get("_api_tool_choice", "auto") if remote else "required"
-    thinking = thinking_params(c, "AGENT")
     payload = {
         "model": c["AGENT_LLM_MODEL"],
         "messages": messages,
         "tools": tools,
-        "tool_choice": choice,
+        "tool_choice": AGENT_TOOL_CHOICE,
         "stream": False,
         "max_tokens": integer(c, "AGENT_MAX_OUTPUT_TOKENS", 2048, 1),
-        **thinking,
+        "temperature": (
+            0 if probe else float(c["AGENT_REGENERATE_TEMPERATURE"] if generation else c["AGENT_TEMPERATURE"])
+        ),
+        **AGENT_THINKING,
     }
-    if thinking.get("thinking", {}).get("type") != "enabled":
-        payload["temperature"] = (
-            0
-            if probe
-            else float(c["AGENT_REGENERATE_TEMPERATURE"] if generation else c["AGENT_TEMPERATURE"])
-        )
     if not remote:
+        payload.update(thinking_params({**c, "AGENT_ENABLE_THINKING": "false"}, "AGENT"))
         payload["parallel_tool_calls"] = True
         if seed is not None:
             payload["seed"] = seed
-    if probe and c.get("AGENT_REASONING_EFFORT") != "low":
+    if probe:
         payload["max_tokens"] = min(payload["max_tokens"], 512)
     return payload
 
@@ -1203,7 +1201,7 @@ def verify_tool_capability(store, c, classes, tools, counter):
     from experiment_io import verify_deployment
 
     identity = verify_deployment(store, c, "AGENT")
-    capability_hash = digest([identity, counter.identity, "batched-tool-probe-v3", thinking_params(c, "AGENT")])
+    capability_hash = digest([identity, counter.identity, "batched-tool-probe-v4", AGENT_TOOL_CHOICE, AGENT_THINKING])
     if store.meta("capability_verified") == capability_hash:
         return
     owner = "capability:agent:" + capability_hash[:16]
@@ -1218,14 +1216,20 @@ def verify_tool_capability(store, c, classes, tools, counter):
             "expand_community", expansions,
             f"只调用一次 expand_community，参数为 {dumps({'queries': expansions})}。",
         ),
-        ("submit", None, f"只调用 submit，prediction={class_id}。"),
+        (
+            "submit", None,
+            f"请结束验证。若允许纯文本回复，只回复“验证完成”。若本轮必须调用工具，只调用 submit，prediction={class_id}。",
+        ),
     ]
-    messages = [{"role": "system", "content": "验证原生工具协议。根据当前用户指令调用函数。"}]
+    messages = [{"role": "system", "content": "验证原生工具协议。按当前用户指令完成每一步。"}]
     call_ids = set()
     for step, (name, expected, instruction) in enumerate(stages, 1):
         messages = messages + [{"role": "user", "content": instruction}]
         payload = agent_payload(c, messages, tools, probe=True)
-        raw, aid = request_model(store, c, "AGENT", owner, step, 0, payload)
+        try:
+            raw, aid = request_model(store, c, "AGENT", owner, step, 0, payload)
+        except ConfigFailure as error:
+            raise ConfigFailure(f"Capability check with tool_choice=required failed at round {step}: {error}") from error
         try:
             message = raw["choices"][0]["message"]
             calls = parse_calls(message)
@@ -1254,8 +1258,9 @@ def verify_tool_capability(store, c, classes, tools, counter):
             store.failure(owner=owner, step_id=step, attempt_id=aid, code="TOOL_PROBE_FAILED", exposed=False)
             with store.tx() as db:
                 db.execute("UPDATE requests SET rejected=1 WHERE id=?", (aid,))
-            raise ConfigFailure(f"Batched tool probe failed at round {step}") from error
+            raise ConfigFailure(f"Capability check with tool_choice=required failed at round {step}: {error}") from error
     store.set_meta("remote_tool_capabilities", {
+        "tool_choice": AGENT_TOOL_CHOICE,
         "batched_queries_verified": size > 1,
         "queries_per_call_verified": size,
         "token_count": "local_tokenizer" if counter.exact else "utf8_envelope_estimate",
@@ -1546,6 +1551,7 @@ def run_tasks(store, plan, data, c, classes, tools, counter):
 
 
 def run(c):
+    c = {**c, "AGENT_ENABLE_THINKING": "false"}
     folder = config_path(c, "EXPERIMENT_ROOT") / c["EXPERIMENT_ID"]
     with process_lock(folder):
         store = Store(folder / "experiment.sqlite")
@@ -1619,7 +1625,8 @@ def run(c):
                 "schema_version": VERSION,
                 "experiment_id": c["EXPERIMENT_ID"],
                 "algorithm": AGENT_ALGORITHM,
-                "thinking_request": thinking_params(c, "AGENT"),
+                "thinking_request": AGENT_THINKING,
+                "tool_choice": AGENT_TOOL_CHOICE,
                 "git_commit_sha": store.meta("source_commit"),
                 "tool_schema_sha256": digest(tools),
                 "system_prompt_sha256_by_mode": {m: digest(text) for m, text in prompts.items()},
@@ -1662,11 +1669,8 @@ def main():
     parser.add_argument("--target-seed", type=int)
     parser.add_argument("--target-plan", help="Use an existing evaluation node plan")
     parser.add_argument("--experiment-id")
-    parser.add_argument("--reasoning-effort", choices=("low",), help="Opt in to DeepSeek Low Thinking")
     args = parser.parse_args()
     c = load_env(args.env, model_stage="AGENT")
-    if args.reasoning_effort == "low":
-        configure_agent_low_thinking(c)
     if args.experiment_id:
         c["EXPERIMENT_ID"] = args.experiment_id
     if args.target_plan:

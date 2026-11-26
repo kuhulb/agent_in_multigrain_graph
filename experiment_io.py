@@ -18,7 +18,7 @@ import uuid
 
 VERSION = 3
 ALGORITHM = "multigrain-v3.1"
-AGENT_ALGORITHM = "multigrain-agent-v3.9"
+AGENT_ALGORITHM = "multigrain-agent-v3.9-required"
 TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -602,7 +602,11 @@ def result_for_task(db, key, task, include_trace=True):
 
 
 def usage_for(db, owner=None, *, capability_only=False):
-    sql = """SELECT status,usage,rejected,json_extract(response, '$.choices[0].finish_reason') AS finish_reason
+    sql = """SELECT status,usage,rejected,
+                    json_extract(response, '$.choices[0].finish_reason') AS finish_reason,
+                    json_type(response, '$.choices[0].message') AS message_type,
+                    json_extract(response, '$.choices[0].message.content') AS content,
+                    json_type(response, '$.choices[0].message.content') AS content_type
              FROM requests WHERE status <> 'prepared'"""
     if capability_only:
         rows = db.execute(sql + " AND owner LIKE 'capability:%'").fetchall()
@@ -615,6 +619,7 @@ def usage_for(db, owner=None, *, capability_only=False):
     paired_input = paired_cache = cache_known = cache_positive = 0
     usage_missing = usage_invalid = 0
     rejected_attempts = rejected_total_known = rejected_total = 0
+    content_observed = content_nonempty = content_chars = content_tokens_known = content_tokens = 0
     max_output = None
     for row in rows:
         u = json.loads(row["usage"]) if row["usage"] else {}
@@ -627,6 +632,23 @@ def usage_for(db, owner=None, *, capability_only=False):
             ):
                 legacy["total_tokens"] = legacy["input_tokens"] + legacy["output_tokens"]
             u = legacy
+        content_observed += row["message_type"] == "object"
+        if row["content_type"] == "text" and row["content"]:
+            content_nonempty += 1
+            content_chars += len(row["content"])
+            raw_usage = u.get("raw")
+            if not isinstance(raw_usage, dict):
+                raw_usage = {}
+            details = raw_usage.get("completion_tokens_details")
+            plain_tokens = details.get("content_tokens") if isinstance(details, dict) else None
+            if plain_tokens is None:
+                plain_tokens = raw_usage.get("content_tokens")
+            if (
+                type(plain_tokens) is int and plain_tokens >= 0
+                and (u.get("output_tokens") is None or plain_tokens <= u["output_tokens"])
+            ):
+                content_tokens_known += 1
+                content_tokens += plain_tokens
         usage_missing += not any(u.get(k) is not None for k in TOKEN_FIELDS)
         usage_invalid += bool(u.get("issues"))
         if row["rejected"]:
@@ -660,6 +682,12 @@ def usage_for(db, owner=None, *, capability_only=False):
         if rejected_total_known or not rejected_attempts else None,
         "finish_reason_known_requests": sum(r["finish_reason"] is not None for r in rows),
         "finish_length_requests": sum(r["finish_reason"] == "length" for r in rows),
+        "content_observed_requests": content_observed,
+        "content_nonempty_requests": content_nonempty,
+        "content_nonempty_ratio": content_nonempty / content_observed if content_observed else None,
+        "content_chars": content_chars,
+        "content_tokens_known_requests": content_tokens_known,
+        "known_content_tokens": content_tokens if content_tokens_known else None,
         "max_output_tokens": max_output,
         "cache_pair_input_tokens": paired_input,
         "cache_pair_cached_tokens": paired_cache,
